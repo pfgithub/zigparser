@@ -188,6 +188,7 @@ const Ast = union(enum) {
 pub fn main() !void {
     var alloc = std.heap.page_allocator;
     var arenaAllocator = std.heap.ArenaAllocator.init(alloc);
+    defer arenaAllocator.deinit();
     var arena = &arenaAllocator.allocator;
 
     const parser = Parser(.{
