@@ -55,6 +55,19 @@ const Point = struct {
     byte: u64,
     line: u64,
     char: u64,
+    pub const start = Point{ .byte = 0, .line = 0, .char = 0 };
+    pub fn extend(start_: Point, text: []const u8) Range {
+        var end: Point = .{ .byte = start_.byte, .line = start_.line, .char = start_.char };
+        for (text) |char| {
+            end.byte += 1;
+            end.char += 1;
+            if (char == '\n') {
+                end.line += 1;
+                end.char = 0;
+            }
+        }
+        return .{ .start = start_, .end = end };
+    }
 };
 const Range = struct {
     start: Point,
@@ -65,18 +78,25 @@ const Range = struct {
     };
 };
 const UncastedValue = *const @OpaqueType(); // @Type(.Opaque) seems to be TODO in 0.6.0
-const ParseResult = struct {
-    value: UncastedValue,
+const ErrResult = struct {
+    message: []const u8,
     range: Range,
 };
-const ParseFn = fn (text: []const u8, alloc: *Alloc) OOM!?ParseResult;
+const ParseResult = union(enum) {
+    result: struct {
+        value: UncastedValue,
+        range: Range,
+    },
+    errmsg: ErrResult,
+};
+const ParseFn = fn (text: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult;
 const ParseDetails = struct {
     parse: ParseFn,
     ReturnType: type,
 };
 
-fn castParseResult(comptime RV: type, parseResult: ParseResult) *const RV {
-    return @ptrCast(*const RV, @alignCast(8, parseResult.value));
+fn castParseResult(comptime RV: type, anyPtr: UncastedValue) *const RV {
+    return @ptrCast(*const RV, @alignCast(8, anyPtr));
 }
 
 /// handler: null | fn(a: var, b: var) type;
@@ -93,24 +113,40 @@ pub fn createStringParse(
     // @typeInfo(handler).Fn.return_type.?;
 
     const parseFn: ParseFn = struct {
-        fn a(text: []const u8, alloc: *Alloc) OOM!?ParseResult {
-            if (text.len < spec.len) return null;
+        fn a(text: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult {
+            if (text.len < spec.len)
+                return ParseResult{
+                    .errmsg = .{
+                        .message = "Expected `" ++ spec ++ "`",
+                        .range = start.extend("  "),
+                    },
+                };
             for (spec) |char, i| {
-                if (char != text[i]) return null;
+                if (char != text[i])
+                    return ParseResult{
+                        .errmsg = .{
+                            .message = "Expected `" ++ spec ++ "`",
+                            .range = start.extend("  "),
+                        },
+                    };
             }
             const range = Range.todo;
             const strCopy = try std.mem.dupe(alloc, u8, spec);
             if (nullHandler) {
                 return ReturnType{
-                    .value = strCopy,
-                    .range = range,
+                    .result = .{
+                        .value = strCopy,
+                        .range = range,
+                    },
                 };
             }
             var res = try alloc.create(ReturnType);
             res.* = handler(strCopy, range);
             return ParseResult{
-                .value = @ptrCast(UncastedValue, res),
-                .range = range,
+                .result = .{
+                    .value = @ptrCast(UncastedValue, res),
+                    .range = range,
+                },
             };
         }
     }.a;
@@ -168,13 +204,25 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
             pub fn parse(
                 comptime key: var,
                 text: []const u8,
+                start: Point,
                 alloc: *Alloc,
-            ) OOM!?*const parses.get(@tagName(key)).?.ReturnType {
+            ) OOM!union {
+                result: struct {
+                    value: *const parses.get(@tagName(key)).?.ReturnType,
+                    range: Range,
+                },
+                errmsg: ErrResult,
+            } {
                 const parseDetails = parses.get(@tagName(key)).?;
-                return if (try parseDetails.parse(text, alloc)) |res|
-                    castParseResult(parseDetails.ReturnType, res)
-                else
-                    null;
+                return switch (try parseDetails.parse(text, start, alloc)) {
+                    .result => |res| blk: {
+                        const result = castParseResult(parseDetails.ReturnType, res.value);
+                        break :blk .{ .result = .{ .value = result, .range = res.range } };
+                    },
+                    .errmsg => |emsg| blk: {
+                        break :blk .{ .errmsg = emsg };
+                    },
+                };
             }
         };
     }
@@ -199,21 +247,10 @@ pub fn main() !void {
             return text;
         }
     });
-    const res = (try parser.parse(.expression, "test", arena)) orelse @panic("error parsing");
-    std.debug.warn("res: {}\n", .{res.*});
-    // Parser.create( .{
-    //  .expression = .{.add},
-    //  .add = .{.add = .add, .next = .subtract},
-    // }, struct{
-    //     fn expression(in: f64) f64 {
-    //         return in;
-    //     }
-    //     fn add(orexpr: var) gf64 {
-    //         // orexpr is a union. unfortunately, unions can not be constructed yet in zig. so rip.
-    //         if(orexpr.add) |v| {
-    //             const add = @as(struct{a: f64, b: f64}, v);
-    //             return add.a + add.b;
-    //         }
-    //     }
-    // });
+    const res = (try parser.parse(.expression, "test", Point.start, arena));
+    std.debug.warn("res: {}\n", .{res.result.value.*});
+    const res2 = (try parser.parse(.expression, "tst", Point.start, arena));
+    std.debug.warn("err: {}\n", .{res2.errmsg.message});
 }
+
+test "" {}
