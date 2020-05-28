@@ -76,7 +76,7 @@ const ParseDetails = struct {
 };
 
 fn castParseResult(comptime RV: type, parseResult: ParseResult) *const RV {
-    return @ptrCast(*const RV, parseResult.value);
+    return @ptrCast(*const RV, @alignCast(8, parseResult.value));
 }
 
 /// handler: null | fn(a: var, b: var) type;
@@ -172,7 +172,7 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
             ) OOM!?*const parses.get(@tagName(key)).?.ReturnType {
                 const parseDetails = parses.get(@tagName(key)).?;
                 return if (try parseDetails.parse(text, alloc)) |res|
-                    @ptrCast(*const parseDetails.ReturnType, @alignCast(8, res.value))
+                    castParseResult(parseDetails.ReturnType, res)
                 else
                     null;
             }
