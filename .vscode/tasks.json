@@ -7,14 +7,19 @@
       "label": "Run",
       "type": "shell",
       "command": "zig build run",
-      "problemMatcher": [
-        "$gcc"
-      ]
+      "problemMatcher": ["$gcc"]
     },
     {
       "label": "Build",
       "type": "shell",
-      "command": "zig build"
+      "command": "zig build",
+      "problemMatcher": ["$gcc"]
+    },
+    {
+      "label": "Test",
+      "type": "shell",
+      "command": "zig test",
+      "problemMatcher": ["$gcc"]
     }
   ]
 }
