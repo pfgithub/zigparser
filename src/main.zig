@@ -291,6 +291,10 @@ pub fn userToReal(
         }
         return createOrderedParse(pdArray, handler, HandlerReturnType);
     }
+    if (@TypeOf(Spec) == @TypeOf(.EnumLiteral)) {
+        // return a "futureparse" or the real value if it has been initialized
+        @compileError("todo;");
+    }
     @compileError("Unsupported: " ++ @typeName(Spec));
 }
 
@@ -308,12 +312,15 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
         var parses = ComptimeHashMap([]const u8, ParseDetails).init();
 
         for (meta.fields(@TypeOf(spec))) |field| {
-            const hasHandler = @hasDecl(Handlers, field.name) or @hasDecl(Handlers, field.name ++ "_RV");
+            if (!@hasDecl(Handlers, field.name ++ "_RV"))
+                @compileError("Missing pub decl " ++ field.name ++ "_RV");
+            if (!@hasDecl(Handlers, field.name))
+                @compileError("Missing pub fn " ++ field.name);
             if (parses.set(field.name, createParse(
                 field.name,
                 @field(spec, field.name),
-                if (hasHandler) @field(Handlers, field.name) else null,
-                if (hasHandler) @field(Handlers, field.name ++ "_RV") else null,
+                @field(Handlers, field.name),
+                @field(Handlers, field.name ++ "_RV"),
             ))) |detyls| @compileError("Duplicate key " ++ field.name);
         }
 
@@ -361,10 +368,9 @@ pub fn main() !void {
 
     const parser = Parser(.{
         .stringtest = "test",
-        .stringdefaultout = "test",
         .ordertest = .{ "test", "-", "interesting" },
         .nestedtest = .{ "one", .{ " ", "two" } },
-        .ordertestdefaultout = .{ "test", "-", "interesting" },
+        // .reftest = .{ "=", .reftest }, // will always error but should be useful
     }, struct {
         pub const stringtest_RV = []const u8;
         pub fn stringtest(text: var, range: Range) stringtest_RV {
@@ -391,14 +397,8 @@ pub fn main() !void {
     const res5 = (try parser.parse(.ordertest, "test!interesting", Point.start, arena));
     std.debug.warn("res: {}, rng: {}\n", .{ res5.errmsg.message, res5.errmsg.range });
 
-    const res8 = (try parser.parse(.stringdefaultout, "test", Point.start, arena));
-    std.debug.warn("res8: {}\n", .{res8.result.value.*});
-
     const res7 = try parser.parse(.nestedtest, "one two", Point.start, arena);
     std.debug.warn("res7: {}\n", .{res7.result.value.*});
-
-    const res6 = (try parser.parse(.ordertestdefaultout, "test-interesting", Point.start, arena));
-    std.debug.warn("res: {}\n", .{res6.result.value.value.get(0)});
 }
 
 test "" {}
