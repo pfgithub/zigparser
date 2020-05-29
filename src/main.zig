@@ -5,7 +5,7 @@ const Alloc = std.mem.Allocator;
 const OOM = Alloc.Error;
 
 /// the stdlib comptime hashmap is only created once and makes a "perfect hash"
-/// so this works I guess. for strings with type values;
+/// so this works I guess.
 ///
 /// comptime "hash"map. all accesses and sets are ~~O(1)~~ O(n)
 pub fn ComptimeHashMap(comptime Key: type, comptime Value: type) type {
@@ -65,14 +65,6 @@ const TypeIDMap = struct {
     }
 };
 
-// type Parse = {
-//     parse: ParseFN;
-//     toString: ToStringFN;
-//     scb: (cb: PostFN) => Parse;
-// };
-
-// errors are going to be user defined (eg with error()) so that is why ?*void
-// so how do user defined error texts propagate? union{error: ..., value: *void}?
 const Point = struct {
     byte: u64,
     line: u64,
@@ -99,7 +91,7 @@ const Range = struct {
         .end = .{ .byte = 0, .line = 0, .char = 0 },
     };
 };
-// a pointer to arbitrary data. panics if attempted to be read as the wrong type.
+/// a pointer to arbitrary data. panics if attempted to be read as the wrong type.
 const AnyPtr = comptime blk: {
     var typeIDMap = TypeIDMap.init();
     break :blk struct {
@@ -158,7 +150,6 @@ fn returnValue(value: var, range: Range) ParseResult {
     };
 }
 
-/// handler: null | fn(a: var, b: var) type;
 pub fn createStringParse(
     comptime spec: []const u8,
     comptime handler: var,
@@ -245,10 +236,6 @@ pub fn createOrderedParse(
     comptime handler: var,
     comptime HandlerReturnType: ?type,
 ) ParseDetails {
-    // list type has to be a thing
-    // .get(index) => *const ActualResultType
-    // default is struct {value: ListType, range: Range}
-    // otherwise HandlerReturnTypet
     const List = TypedList(spec);
 
     const Handler = CreateHandler(List, handler, HandlerReturnType);
