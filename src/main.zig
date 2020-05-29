@@ -95,15 +95,14 @@ const Range = struct {
 const AnyPtr = comptime blk: {
     var typeIDMap = TypeIDMap.init();
     break :blk struct {
-        const AnyRawPtrType = *const @OpaqueType();
-        pointer: AnyRawPtrType,
+        pointer: usize,
         typeID: u64,
         fn fromPtr(value: var) AnyPtr {
             const ti = @typeInfo(@TypeOf(value));
             if (ti != .Pointer) @compileError("must be *ptr");
             if (ti.Pointer.size != .One) @compileError("must be ptr to one item");
             const typeID = comptime typeIDMap.get(ti.Pointer.child);
-            return .{ .pointer = @ptrCast(AnyRawPtrType, value), .typeID = typeID };
+            return .{ .pointer = @ptrToInt(value), .typeID = typeID };
         }
         fn readAs(any: AnyPtr, comptime RV: type) *const RV {
             const typeID = comptime typeIDMap.get(RV);
@@ -112,7 +111,7 @@ const AnyPtr = comptime blk: {
                     "\x1b[31mError!\x1b(B\x1b[m Item is of type {}, but was read as type {}. Type names ({}):\n{}",
                     .{ any.typeID, typeID, typeIDMap.latestID, typeIDMap.infoString },
                 );
-            return @ptrCast(*const RV, @alignCast(@alignOf(RV), any.pointer));
+            return @intToPtr(*const RV, any.pointer);
         }
     };
 };
