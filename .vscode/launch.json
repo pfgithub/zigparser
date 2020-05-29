@@ -9,8 +9,9 @@
       "request": "launch",
       "name": "GDB",
       "program": "${workspaceFolder}/zig-cache/bin/zigparser",
-      "stopOnEntry": true,
-      "arguments": ""
+      "stopOnEntry": false,
+      "arguments": "",
+      "preLaunchTask": "Run"
     }
   ]
 }
