@@ -9,7 +9,6 @@ const OOM = Alloc.Error;
 ///
 /// comptime "hash"map. all accesses and sets are ~~O(1)~~ O(n)
 pub fn ComptimeHashMap(comptime Key: type, comptime Value: type) type {
-    if (Key != []const u8) @compileError("key must be []const u8");
     const Item = struct { key: Key, value: Value };
     return struct {
         const HM = @This();
@@ -21,13 +20,15 @@ pub fn ComptimeHashMap(comptime Key: type, comptime Value: type) type {
         }
         fn findIndex(comptime hm: *HM, comptime key: Key) ?u64 {
             for (hm.items) |itm, i| {
-                if (std.mem.eql(u8, itm.key, key)) {
+                if (Key == []const u8) {
+                    if (std.mem.eql(u8, itm.key, key))
+                        return i;
+                } else if (itm.key == key)
                     return i;
-                }
             }
             return null;
         }
-        fn get(comptime hm: *HM, comptime key: Key) ?Value {
+        pub fn get(comptime hm: *HM, comptime key: Key) ?Value {
             if (hm.findIndex(key)) |indx| return hm.items[indx].value;
             return null;
         }
@@ -42,6 +43,27 @@ pub fn ComptimeHashMap(comptime Key: type, comptime Value: type) type {
         }
     };
 }
+
+const TypeIDMap = struct {
+    latestID: u64,
+    hm: ComptimeHashMap(type, u64),
+    infoString: []const u8,
+    pub fn init() TypeIDMap {
+        return .{
+            .latestID = 0,
+            .hm = ComptimeHashMap(type, u64).init(),
+            .infoString = "",
+        };
+    }
+    pub fn get(comptime tidm: *TypeIDMap, comptime Type: type) u64 {
+        if (tidm.hm.get(Type)) |index| return index;
+        tidm.latestID += 1;
+        if (tidm.hm.set(Type, tidm.latestID)) |_| @compileError("never");
+        tidm.infoString = tidm.infoString ++ comptime comptimeFmt("ID {} - {}", .{ tidm.latestID, typePrint(Type, 0) }) ++ "\n";
+        // @compileLog("ID", tidm.latestID, "=", Type);
+        return tidm.latestID;
+    }
+};
 
 // type Parse = {
 //     parse: ParseFN;
@@ -77,14 +99,38 @@ const Range = struct {
         .end = .{ .byte = 0, .line = 0, .char = 0 },
     };
 };
-const UncastedValue = *const @OpaqueType(); // @Type(.Opaque) seems to be TODO in 0.6.0
+// a pointer to arbitrary data. panics if attempted to be read as the wrong type.
+const AnyPtr = comptime blk: {
+    var typeIDMap = TypeIDMap.init();
+    break :blk struct {
+        const AnyRawPtrType = *const @OpaqueType();
+        pointer: AnyRawPtrType,
+        typeID: u64,
+        fn fromPtr(value: var) AnyPtr {
+            const ti = @typeInfo(@TypeOf(value));
+            if (ti != .Pointer) @compileError("must be *ptr");
+            if (ti.Pointer.size != .One) @compileError("must be ptr to one item");
+            const typeID = comptime typeIDMap.get(ti.Pointer.child);
+            return .{ .pointer = @ptrCast(AnyRawPtrType, value), .typeID = typeID };
+        }
+        fn readAs(any: AnyPtr, comptime RV: type) *const RV {
+            const typeID = comptime typeIDMap.get(RV);
+            if (any.typeID != typeID)
+                std.debug.panic(
+                    "\x1b[31mError!\x1b(B\x1b[m Item is of type {}, but was read as type {}. Type names ({}):\n{}",
+                    .{ any.typeID, typeID, typeIDMap.latestID, typeIDMap.infoString },
+                );
+            return @ptrCast(*const RV, @alignCast(@alignOf(RV), any.pointer));
+        }
+    };
+};
 const ErrResult = struct {
     message: []const u8,
     range: Range,
 };
 const ParseResult = union(enum) {
     result: struct {
-        value: UncastedValue,
+        value: AnyPtr,
         range: Range,
     },
     errmsg: ErrResult,
@@ -95,8 +141,21 @@ const ParseDetails = struct {
     ReturnType: type,
 };
 
-fn castParseResult(comptime RV: type, anyPtr: UncastedValue) *const RV {
-    return @ptrCast(*const RV, @alignCast(8, anyPtr));
+fn errorValue(emsg: []const u8, range: Range) ParseResult {
+    return .{
+        .errmsg = .{
+            .message = emsg,
+            .range = range,
+        },
+    };
+}
+fn returnValue(value: var, range: Range) ParseResult {
+    return .{
+        .result = .{
+            .value = AnyPtr.fromPtr(value),
+            .range = range,
+        },
+    };
 }
 
 /// handler: null | fn(a: var, b: var) type;
@@ -106,50 +165,121 @@ pub fn createStringParse(
     comptime HandlerReturnType: ?type,
 ) ParseDetails {
     const nullHandler = @TypeOf(handler) == @TypeOf(null);
-    const ReturnType = if (nullHandler)
-        struct { value: []const u8, range: Range }
-    else
-        HandlerReturnType.?;
+    const ReturnType = HandlerReturnType orelse
+        struct { value: []const u8, range: Range };
     // @typeInfo(handler).Fn.return_type.?;
 
     const parseFn: ParseFn = struct {
-        fn a(text: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult {
+        fn a(fulltext: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult {
+            const text = fulltext[start.byte..];
             if (text.len < spec.len)
-                return ParseResult{
-                    .errmsg = .{
-                        .message = "Expected `" ++ spec ++ "`",
-                        .range = start.extend("  "),
-                    },
-                };
+                return errorValue(
+                    "Expected `" ++ spec ++ "` (too short)",
+                    start.extend("  "),
+                );
             for (spec) |char, i| {
                 if (char != text[i])
-                    return ParseResult{
-                        .errmsg = .{
-                            .message = "Expected `" ++ spec ++ "`",
-                            .range = start.extend("  "),
-                        },
-                    };
+                    return errorValue(
+                        "Expected `" ++ spec ++ "`",
+                        start.extend("  "),
+                    );
             }
-            const range = Range.todo;
+            const range = start.extend(spec);
             const strCopy = try std.mem.dupe(alloc, u8, spec);
             if (nullHandler) {
-                return ReturnType{
-                    .result = .{
-                        .value = strCopy,
-                        .range = range,
-                    },
+                const rv = try alloc.create(ReturnType);
+                rv.* = .{
+                    .value = strCopy,
+                    .range = range,
                 };
+                return returnValue(rv, range);
             }
             var res = try alloc.create(ReturnType);
             res.* = handler(strCopy, range);
-            return ParseResult{
-                .result = .{
-                    .value = @ptrCast(UncastedValue, res),
-                    .range = range,
-                },
-            };
+            return returnValue(res, range);
         }
     }.a;
+    return ParseDetails{
+        .parse = parseFn,
+        .ReturnType = ReturnType,
+    };
+}
+pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
+    comptime {
+        const width = std.fmt.count(fmt, arg);
+        var buf: [width]u8 = undefined;
+        return std.fmt.bufPrint(&buf, fmt, arg) catch unreachable;
+    }
+}
+pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8 {
+    const indent = " " ** 4;
+    const ti = @typeInfo(Type);
+    return switch (ti) {
+        .Struct => |stru| blk: {
+            var res: []const u8 = "struct {";
+            const newline = "\n" ++ (indent ** indentationLevel);
+            for (stru.fields) |field| {
+                res = res ++ newline ++ indent ++ field.name ++ ": " ++ typePrint(field.field_type, indentationLevel + 1) ++ ",";
+            }
+            for (stru.decls) |decl| {
+                res = res ++ newline ++ indent ++ "const " ++ decl.name ++ ";";
+            }
+            res = res ++ newline ++ "}";
+            break :blk res;
+        },
+        else => @typeName(Type),
+    };
+}
+pub fn TypedList(comptime spec: []const ParseDetails) type {
+    return struct {
+        items: [spec.len]struct { value: AnyPtr, range: Range } = undefined,
+        pub fn get(list: @This(), comptime index: u64) struct { value: *const spec[index].ReturnType, range: Range } {
+            return .{ .value = list.items[index].value.readAs(spec[index].ReturnType), .range = list.items[index].range };
+        }
+    };
+}
+pub fn createOrderedParse(
+    comptime spec: []const ParseDetails,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) ParseDetails {
+    // list type has to be a thing
+    // .get(index) => *const ActualResultType
+    // default is struct {value: ListType, range: Range}
+    // otherwise HandlerReturnTypet
+    const List = TypedList(spec);
+
+    const nullHandler = @TypeOf(handler) == @TypeOf(null);
+    const ReturnType = HandlerReturnType orelse
+        struct { value: List, range: Range };
+
+    const parseFn = struct {
+        fn a(fulltext: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult {
+            const text = fulltext[start.byte..];
+            var result: List = .{};
+            var currentPoint: Point = start;
+            inline for (spec) |specItem, i| {
+                const parseResult = try specItem.parse(fulltext, currentPoint, alloc);
+                if (parseResult == .errmsg) return parseResult;
+                currentPoint = parseResult.result.range.end;
+                result.items[i] = .{ .value = parseResult.result.value, .range = parseResult.result.range };
+            }
+
+            const range: Range = .{ .start = start, .end = currentPoint };
+            if (nullHandler) {
+                const rv = try alloc.create(ReturnType);
+                rv.* = .{
+                    .value = result,
+                    .range = range,
+                };
+                return returnValue(rv, range);
+            }
+            var res = try alloc.create(ReturnType);
+            res.* = handler(result, range);
+            return returnValue(res, range);
+        }
+    }.a;
+
     return ParseDetails{
         .parse = parseFn,
         .ReturnType = ReturnType,
@@ -175,6 +305,13 @@ pub fn userToReal(
     const Spec = @TypeOf(spec);
     if (isString(Spec))
         return createStringParse(@as([]const u8, spec), handler, HandlerReturnType);
+    if (@typeInfo(Spec) == .Struct) {
+        var pdArray: []const ParseDetails = &[_]ParseDetails{};
+        for (spec) |userItem| {
+            pdArray = pdArray ++ [_]ParseDetails{userToReal(userItem, null, null)};
+        }
+        return createOrderedParse(pdArray, handler, HandlerReturnType);
+    }
     @compileError("Unsupported: " ++ @typeName(Spec));
 }
 
@@ -184,7 +321,7 @@ pub fn createParse(
     comptime handler: var,
     comptime HandlerReturnType: ?type,
 ) ParseDetails {
-    return userToReal(spec, handler, HandlerReturnType);
+    return comptime userToReal(spec, handler, HandlerReturnType);
 }
 
 pub fn Parser(comptime spec: var, comptime Handlers: type) type {
@@ -192,15 +329,19 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
         var parses = ComptimeHashMap([]const u8, ParseDetails).init();
 
         for (meta.fields(@TypeOf(spec))) |field| {
+            const hasHandler = @hasDecl(Handlers, field.name) or @hasDecl(Handlers, field.name ++ "_RV");
             if (parses.set(field.name, createParse(
                 field.name,
                 @field(spec, field.name),
-                @field(Handlers, field.name),
-                @field(Handlers, field.name ++ "_RV"),
+                if (hasHandler) @field(Handlers, field.name) else null,
+                if (hasHandler) @field(Handlers, field.name ++ "_RV") else null,
             ))) |detyls| @compileError("Duplicate key " ++ field.name);
         }
 
         return struct {
+            pub fn getReturnType(comptime key: var) type {
+                return parses.get(@tagName(key)).?.ReturnType;
+            }
             pub fn parse(
                 comptime key: var,
                 text: []const u8,
@@ -216,7 +357,7 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
                 const parseDetails = parses.get(@tagName(key)).?;
                 return switch (try parseDetails.parse(text, start, alloc)) {
                     .result => |res| blk: {
-                        const result = castParseResult(parseDetails.ReturnType, res.value);
+                        const result = res.value.readAs(parseDetails.ReturnType);
                         break :blk .{ .result = .{ .value = result, .range = res.range } };
                     },
                     .errmsg => |emsg| blk: {
@@ -240,17 +381,45 @@ pub fn main() !void {
     var arena = &arenaAllocator.allocator;
 
     const parser = Parser(.{
-        .expression = "test",
+        .stringtest = "test",
+        .stringdefaultout = "test",
+        .ordertest = .{ "test", "-", "interesting" },
+        .nestedtest = .{ "one", .{ " ", "two" } },
+        .ordertestdefaultout = .{ "test", "-", "interesting" },
     }, struct {
-        pub const expression_RV = []const u8;
-        pub fn expression(text: var, pos: var) expression_RV {
+        pub const stringtest_RV = []const u8;
+        pub fn stringtest(text: var, range: Range) stringtest_RV {
             return text;
         }
+        pub const ordertest_RV = u1;
+        pub fn ordertest(items: var, range: Range) ordertest_RV {
+            return 0;
+        }
+        pub const nestedtest_RV = []const u8;
+        pub fn nestedtest(items: var, range: Range) []const u8 {
+            return items.get(0).value.value;
+        }
     });
-    const res = (try parser.parse(.expression, "test", Point.start, arena));
+    const res = (try parser.parse(.stringtest, "test", Point.start, arena));
     std.debug.warn("res: {}\n", .{res.result.value.*});
-    const res2 = (try parser.parse(.expression, "tst", Point.start, arena));
+    const res3 = (try parser.parse(.stringtest, "testing", Point.start, arena));
+    std.debug.warn("res: {}, rng: {}\n", .{ res3.result.value.*, res3.result.range });
+    const res2 = (try parser.parse(.stringtest, "tst", Point.start, arena));
     std.debug.warn("err: {}\n", .{res2.errmsg.message});
+
+    const res4 = (try parser.parse(.ordertest, "test-interesting", Point.start, arena));
+    std.debug.warn("res: {}\n", .{res4.result.value.*});
+    const res5 = (try parser.parse(.ordertest, "test!interesting", Point.start, arena));
+    std.debug.warn("res: {}, rng: {}\n", .{ res5.errmsg.message, res5.errmsg.range });
+
+    const res8 = (try parser.parse(.stringdefaultout, "test", Point.start, arena));
+    std.debug.warn("res8: {}\n", .{res8.result.value.*});
+
+    const res7 = try parser.parse(.nestedtest, "one two", Point.start, arena);
+    std.debug.warn("res7: {}\n", .{res7.result.value.*});
+
+    const res6 = (try parser.parse(.ordertestdefaultout, "test-interesting", Point.start, arena));
+    std.debug.warn("res: {}\n", .{res6.result.value.value.get(0)});
 }
 
 test "" {}
