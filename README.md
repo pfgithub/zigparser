@@ -1,4 +1,5 @@
 # zigparser
+
 wip parser thing in zig
 
 ## interface goal
@@ -23,7 +24,7 @@ Parser(.{
   pub fn _(match: var, pos: Range) __RV {
     return {};
   }
-  
+
 }).parse(
   .expression,
   \\a = b
@@ -58,3 +59,9 @@ without a tokenizer:
 .templateString = .{"`", star(.char), "`"},
 .char = .{.{"\\", lockin, "(", ._, .expression, ._, ")"}, @"or", regex("[^`\\\\]")}
 ```
+
+## issues
+
+ideally this could be done with less memory allocation,
+only requiring allocation for .futureparses instead of
+for everything as it is right now.
