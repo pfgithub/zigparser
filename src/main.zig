@@ -164,10 +164,7 @@ pub fn createStringParse(
     comptime handler: var,
     comptime HandlerReturnType: ?type,
 ) ParseDetails {
-    const nullHandler = @TypeOf(handler) == @TypeOf(null);
-    const ReturnType = HandlerReturnType orelse
-        struct { value: []const u8, range: Range };
-    // @typeInfo(handler).Fn.return_type.?;
+    const Handler = CreateHandler([]const u8, handler, HandlerReturnType);
 
     const parseFn: ParseFn = struct {
         fn a(fulltext: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult {
@@ -186,22 +183,14 @@ pub fn createStringParse(
             }
             const range = start.extend(spec);
             const strCopy = try std.mem.dupe(alloc, u8, spec);
-            if (nullHandler) {
-                const rv = try alloc.create(ReturnType);
-                rv.* = .{
-                    .value = strCopy,
-                    .range = range,
-                };
-                return returnValue(rv, range);
-            }
-            var res = try alloc.create(ReturnType);
-            res.* = handler(strCopy, range);
+            var res = try alloc.create(Handler.Return);
+            res.* = Handler.handle(strCopy, range);
             return returnValue(res, range);
         }
     }.a;
     return ParseDetails{
         .parse = parseFn,
-        .ReturnType = ReturnType,
+        .ReturnType = Handler.Return,
     };
 }
 pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
@@ -238,6 +227,19 @@ pub fn TypedList(comptime spec: []const ParseDetails) type {
         }
     };
 }
+pub fn CreateHandler(comptime Arg0: type, comptime handler: var, comptime HandlerReturnType: ?type) type {
+    const DefaultReturnType = struct { value: Arg0, range: Range };
+    return struct {
+        pub const Return = HandlerReturnType orelse DefaultReturnType;
+        pub fn handle(value: Arg0, range: Range) Return {
+            if (HandlerReturnType == null) {
+                return .{ .value = value, .range = range };
+            } else {
+                return handler(value, range);
+            }
+        }
+    };
+}
 pub fn createOrderedParse(
     comptime spec: []const ParseDetails,
     comptime handler: var,
@@ -249,9 +251,7 @@ pub fn createOrderedParse(
     // otherwise HandlerReturnTypet
     const List = TypedList(spec);
 
-    const nullHandler = @TypeOf(handler) == @TypeOf(null);
-    const ReturnType = HandlerReturnType orelse
-        struct { value: List, range: Range };
+    const Handler = CreateHandler(List, handler, HandlerReturnType);
 
     const parseFn = struct {
         fn a(fulltext: []const u8, start: Point, alloc: *Alloc) OOM!ParseResult {
@@ -266,23 +266,15 @@ pub fn createOrderedParse(
             }
 
             const range: Range = .{ .start = start, .end = currentPoint };
-            if (nullHandler) {
-                const rv = try alloc.create(ReturnType);
-                rv.* = .{
-                    .value = result,
-                    .range = range,
-                };
-                return returnValue(rv, range);
-            }
-            var res = try alloc.create(ReturnType);
-            res.* = handler(result, range);
+            var res = try alloc.create(Handler.Return);
+            res.* = Handler.handle(result, range);
             return returnValue(res, range);
         }
     }.a;
 
     return ParseDetails{
         .parse = parseFn,
-        .ReturnType = ReturnType,
+        .ReturnType = Handler.Return,
     };
 }
 
