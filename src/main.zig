@@ -127,6 +127,9 @@ const AnyPtr = comptime blk: {
 const ErrResult = struct {
     message: []const u8,
     range: Range,
+    /// if it is possible to allow this error, eg by going to the next item
+    /// in an or or repeating again in a star/plus
+    recoverable: bool,
 };
 const ParseResult = union(enum) {
     result: struct {
@@ -156,6 +159,7 @@ fn errorValue(emsg: []const u8, range: Range) ParseResult {
         .errmsg = .{
             .message = emsg,
             .range = range,
+            .recoverable = true,
         },
     };
 }
@@ -228,11 +232,60 @@ pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8
         else => @typeName(Type),
     };
 }
+// ideally, this would be a tuple created at comptime
 pub fn TypedList(comptime spec: []const ParseDetails) type {
     return struct {
         items: [spec.len]struct { value: AnyPtr, range: Range } = undefined,
         pub fn get(list: @This(), comptime index: u64) struct { value: *const spec[index].ReturnType, range: Range } {
             return .{ .value = list.items[index].value.readAs(spec[index].ReturnType), .range = list.items[index].range };
+        }
+    };
+}
+
+const testing = std.testing;
+test "l2i" {
+    comptime {
+        testing.expect(Log2Int(25) == u5);
+        testing.expect(Log2Int(16) == u4);
+        testing.expect(Log2Int(15) == u4);
+        testing.expect(Log2Int(17) == u5);
+        testing.expect(Log2Int(0) == u0);
+        testing.expect(Log2Int(1) == u0);
+        testing.expect(Log2Int(2) == u1);
+    }
+}
+
+// ideally, this would be a union(enum) created at comptime
+pub fn TypedUnion(comptime spec: []const ParseDetails) type {
+    return struct {
+        value: AnyPtr,
+        range: Range,
+        index: std.math.Log2Int(0, spec.len - 1), // not really necessary, usize is basically the same
+        pub fn from(comptime idx: usize, value: *const spec[idx].ReturnType, range: Range) @This() {
+            return .{ .value = AnyPtr.fromPtr(value), .range = Range, .index = idx };
+        }
+        pub fn get(me: @This(), comptime idx: var) ?*const spec[idx].ReturnType {
+            if (@typeInfo(@TypeOf(idx)) == .Struct) {
+                const MustMatch = spec[idx[0]].ReturnType;
+                inline for (idx) |iv, i| {
+                    if (spec[i].ReturnType != MustMatch)
+                        @compileError("All listed values must be the same to use .get(.{1, 2, 3...}).\none was: " ++
+                            typePrint(mustMatch) ++ ", but another was: " ++ typePrint(spec[i].ReturnType));
+                    if (me.index == i)
+                        break true;
+                } else return null;
+            } else if (me.index != idx) return null;
+            const details = spec[idx];
+            return this.value.readAs(details.ReturnType);
+        }
+        pub fn any(me: @This()) *const spec[0].ReturnType {
+            const MustMatch = spec[0].ReturnType;
+            for (spec) |itm| {
+                if (itm.ReturnType != MustMatch)
+                    @compileError("all possible values must be the same to use .any() on TypedUnion\n" ++
+                        "one was: " ++ typePrint(MustMatch) ++ "\nbut another was: " ++ typePrint(itm.ReturnType));
+            }
+            return me.value.readAs(MustMatch);
         }
     };
 }
@@ -273,6 +326,41 @@ pub fn createOrderedParse(
             const range: Range = .{ .start = start, .end = currentPoint };
             var res = try x.alloc.create(Handler.Return);
             res.* = Handler.handle(result, range);
+            return returnValue(res, range);
+        }
+    }.a;
+
+    return ParseDetails{
+        .parse = parseFn,
+        .ReturnType = Handler.Return,
+    };
+}
+pub fn createOrParse(
+    comptime spec: []const ParseDetails,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) ParseDetails {
+    const Union = TypedUnion(spec);
+
+    const Handler = CreateHandler(List, handler, HandlerReturnType);
+
+    const parseFn = struct {
+        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+            const text = fulltext[start.byte..];
+            var result: Union = undefined;
+            inline for (spec) |specItem, i| {
+                const parseResult = try specItem.parse(fulltext, currentPoint, x);
+                if (parseResult == .errmsg)
+                    if (parseResult.errmsg.recoverable)
+                        continue
+                    else
+                        return parseResult;
+                result = Union.from(i, parseResult.result.value, parseResult.result.range);
+            }
+            // result.range shouldn't really exist but it's fine because it has to have some
+            // data anyway
+            var res = try x.alloc.create(Handler.Return);
+            res.* = Handler.handle(result, result.range);
             return returnValue(res, range);
         }
     }.a;
@@ -323,6 +411,10 @@ pub fn isString(comptime SomeT: type) bool {
     return false;
 }
 
+// eg .{"1", Or, "2", Or, "3", "4"}
+// matches "1" | "2" | "34"
+pub const Or = struct {};
+
 pub fn userToReal(
     comptime spec: var,
     comptime handler: var,
@@ -333,11 +425,38 @@ pub fn userToReal(
     if (isString(Spec))
         return createStringParse(@as([]const u8, spec), handler, HandlerReturnType);
     if (@typeInfo(Spec) == .Struct) {
+        // oh no this is a bit of a mess because handler, HandlerReturnType has to be routed to only one thing
+        var orMatches: []const []const ParseDetails = &[_][]const ParseDetails{};
         var pdArray: []const ParseDetails = &[_]ParseDetails{};
-        for (spec) |userItem| {
+        for (spec) |userItem, i| {
+            if (@TypeOf(userItem) == Or) {
+                orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
+                pdArray = &[_]ParseDetails{};
+            }
             pdArray = pdArray ++ [_]ParseDetails{userToReal(userItem, null, null, parseTypesMap)};
         }
-        return createOrderedParse(pdArray, handler, HandlerReturnType);
+        orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
+        var allPMatches: []const ParseDetails = &[_]ParseDetails{};
+        for (orMatches) |om| {
+            if (om.len > 1 and orMatches.len == 1)
+                allPMatches = allPMatches ++ [_]ParseDetails{createOrderedParse(om, handler, HandlerReturnType)};
+            if (om.len > 1)
+                allPMatches = allPMatches ++ [_]ParseDetails{createOrderedParse(om, null, null)};
+            if (om.len == 1)
+                allPMatches = allPMatches ++ [_]ParseDetails{om[0]};
+            if (om.len == 0)
+                @compileError("must have at least one thing per or");
+        }
+        if (orMatches.len > 1)
+            return createOrParse(allPMatches, handler, HandlerReturnType);
+        if (orMatches.len == 1) {
+            if (orMatches[0].len == 1)
+                @compileError("there must be at least two items in p");
+            return allPMatches[0];
+        }
+        if (orMatches.len == 0)
+            @compileError("must have at least one thing");
+        return createOrParse();
     }
     if (@TypeOf(Spec) == @TypeOf(.EnumLiteral) or std.mem.eql(u8, @typeName(Spec), "(enum literal)")) {
         return createFutureParse(spec, handler, HandlerReturnType, parseTypesMap);
