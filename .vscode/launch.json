@@ -11,7 +11,7 @@
       "program": "${workspaceFolder}/zig-cache/bin/zigparser",
       "stopOnEntry": false,
       "arguments": "",
-      "preLaunchTask": "Run"
+      "preLaunchTask": "Build"
     }
   ]
 }

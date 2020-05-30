@@ -338,15 +338,17 @@ pub fn createOrParse(
     const parseFn = struct {
         fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
             const text = fulltext[start.byte..];
-            var result: Union = undefined;
+            // would use for else, but that doesn't seem to like inline for very much
+            var resultOpt: ?Union = null;
             inline for (spec) |specItem, i| {
                 const parseResult = try specItem.parse(fulltext, start, x);
                 if (parseResult == .errmsg) {
                     if (!parseResult.errmsg.recoverable)
                         return parseResult;
                 } else
-                    result = Union.from(i, parseResult.result.value, parseResult.result.range);
+                    resultOpt = Union.from(i, parseResult.result.value, parseResult.result.range);
             }
+            const result = resultOpt orelse return errorValue("all ors failed", start.extend("  "));
             // result.range shouldn't really exist but it's fine because it has to have some
             // data anyway
             var res = try x.alloc.create(Handler.Return);
@@ -405,6 +407,65 @@ pub fn isString(comptime SomeT: type) bool {
 // matches "1" | "2" | "34"
 pub const Or = struct {};
 
+pub fn star(comptime spec: var) type {
+    return struct {
+        pub const __STAR_ARGS = spec;
+    };
+}
+pub fn createStarParse(
+    comptime spec: ParseDetails,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) ParseDetails {
+    const Handler = CreateHandler([]*const spec.ReturnType, handler, HandlerReturnType);
+
+    const parseFn = struct {
+        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+            const text = fulltext[start.byte..];
+            var fres = std.ArrayList(*const spec.ReturnType).init(x.alloc);
+            // huh, this might be doable
+            // this does offer more possabilities for non pointer returns
+            // the reason fn parse isn't generic is so it can be called at
+            // runtime though.
+            // maybe offer two versions of parse?
+            // one runtime and one generic?
+            // futureparse is the seam that uses the runtime one?
+            // and then we don't have to provide the runtime fn,
+            // Parser can generate it and we just provide the generic
+            // one. Parser adds the runtime one to its fn list.
+            var cpos: Point = start;
+            while (true) {
+                const pres = try spec.parse(fulltext, cpos, x);
+                if (pres == .errmsg) {
+                    if (!pres.errmsg.recoverable)
+                        return pres;
+                    break;
+                }
+                cpos = pres.result.range.end;
+                try fres.append(pres.result.value.readAs(spec.ReturnType));
+                if (pres.result.range.start.byte == pres.result.range.end.byte)
+                    break; // eg star(optional(" "))
+                // imagine what terrible things we could do with operator overloading
+                // *?" " | ?(" ", "|", " ") | .someName
+            }
+            const range = Range{ .start = start, .end = cpos };
+            // here this can support plus with
+            // if fres.len == 0 && isPlus
+            //     return error
+            // result.range shouldn't really exist but it's fine because it has to have some
+            // data anyway
+            var res = try x.alloc.create(Handler.Return);
+            res.* = Handler.handle(fres.toOwnedSlice(), range);
+            return returnValue(res, range);
+        }
+    }.a;
+
+    return ParseDetails{
+        .parse = parseFn,
+        .ReturnType = Handler.Return,
+    };
+}
+
 pub fn userToReal(
     comptime name: []const u8,
     comptime spec: var,
@@ -415,6 +476,10 @@ pub fn userToReal(
     const Spec = @TypeOf(spec);
     if (isString(Spec))
         return createStringParse(@as([]const u8, spec), handler, HandlerReturnType);
+    if (@typeInfo(Spec) == .Type and @typeInfo(spec) == .Struct and @hasDecl(spec, "__STAR_ARGS")) {
+        const realArg = userToReal(name ++ " > anon", spec.__STAR_ARGS, null, null, parseTypesMap);
+        return createStarParse(realArg, handler, HandlerReturnType);
+    }
     if (@typeInfo(Spec) == .Struct) {
         // oh no this is a bit of a mess because handler, HandlerReturnType has to be routed to only one thing
         var orMatches: []const []const ParseDetails = &[_][]const ParseDetails{};
@@ -424,7 +489,7 @@ pub fn userToReal(
                 orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
                 pdArray = &[_]ParseDetails{};
             } else
-                pdArray = pdArray ++ [_]ParseDetails{userToReal(name, userItem, null, null, parseTypesMap)};
+                pdArray = pdArray ++ [_]ParseDetails{userToReal(name ++ " > anon", userItem, null, null, parseTypesMap)};
         }
         orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
         var allPMatches: []const ParseDetails = &[_]ParseDetails{};
@@ -445,9 +510,7 @@ pub fn userToReal(
                 @compileError("there must be at least two items in p");
             return allPMatches[0];
         }
-        if (orMatches.len == 0)
-            @compileError("must have at least one thing");
-        return createOrParse();
+        @compileError("must have at least one thing");
     }
     if (@TypeOf(Spec) == @TypeOf(.EnumLiteral) or std.mem.eql(u8, @typeName(Spec), "(enum literal)")) {
         return createFutureParse(spec, handler, HandlerReturnType, parseTypesMap);
@@ -544,24 +607,25 @@ const Ast = union(enum) {
         moreAst: *Ast,
     },
 };
-pub fn main() !void {
-    @compileError("main not implemented");
+test "" {
+    try main();
 }
 
-test "" {
+pub fn main() !void {
     var alloc = std.heap.page_allocator;
     var arenaAllocator = std.heap.ArenaAllocator.init(alloc);
     defer arenaAllocator.deinit();
     var arena = &arenaAllocator.allocator;
-
     const parser = Parser(.{
         .stringtest = "test",
         .ordertest = .{ "test", "-", "interesting" },
         .nestedtest = .{ "one", .{ " ", "two" } },
         .reftest = .{ "=", .reftest }, // will always error but should be useful for testing before unions
         .math = .addsub,
-        .addsub = .{ .number, .{ "+", Or, "-" }, .number },
+        .addsub = .{ .number, star(.{ .{ "+", Or, "-" }, .number }) },
         .number = .{ "1", Or, "2", Or, "3" },
+        // const _ = ._;
+        // starlastoptional(.{.arg, _}, .{",", _});
     }, struct {
         pub const stringtest_RV = []const u8;
         pub fn stringtest(text: var, range: Range) stringtest_RV {
@@ -585,7 +649,11 @@ test "" {
         }
         pub const addsub_RV = u64;
         pub fn addsub(items: var, range: Range) addsub_RV {
-            return items.get(0).value.value.* + items.get(2).value.value.*;
+            var result = items.get(0).value.value.*;
+            for (items.get(1).value.value) |itm| {
+                result += itm.value.get(1).value.value.*;
+            }
+            return result;
         }
         pub const number_RV = u64;
         pub fn number(items: var, range: Range) number_RV {
@@ -597,6 +665,8 @@ test "" {
             // or go based on value.index, but this works too
             // in js, I would do or(c`1`.scb(r => 1), c`2`.scb(r => 2), c`3`.scb(r => 3))
             // is that better?
+            // it might be possible to make something slightly similar to that in zig, but
+            // I do want to avoid inline functions because it makes the spec less clear.
         }
     });
     testing.expect(
@@ -620,7 +690,7 @@ test "" {
     const res8 = (try parser.parse(.reftest, "====huh", Point.start, arena));
     std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
 
-    const mathequ = try parser.parse(.math, "1+3", Point.start, arena);
+    const mathequ = try parser.parse(.math, "1+3+2", Point.start, arena);
     std.debug.warn("math res: {}\n", .{mathequ.result.value.*});
-    testing.expectEqual(mathequ.result.value.*, 4);
+    testing.expectEqual(mathequ.result.value.*, 6);
 }
