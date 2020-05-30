@@ -612,6 +612,9 @@ test "" {
 }
 
 pub fn main() !void {
+    // takes a lot of eval branch quota because of things like the O(n) "hash"map
+    @setEvalBranchQuota(100_000);
+
     var alloc = std.heap.page_allocator;
     var arenaAllocator = std.heap.ArenaAllocator.init(alloc);
     defer arenaAllocator.deinit();
@@ -622,7 +625,8 @@ pub fn main() !void {
         .nestedtest = .{ "one", .{ " ", "two" } },
         .reftest = .{ "=", .reftest }, // will always error but should be useful for testing before unions
         .math = .addsub,
-        .addsub = .{ .number, star(.{ .{ "+", Or, "-" }, .number }) },
+        .addsub = .{ .muldiv, star(.{ .{ "+", Or, "-" }, .muldiv }) },
+        .muldiv = .{ .number, star(.{ .{ "*", Or, "/" }, .number }) },
         .number = .{ "1", Or, "2", Or, "3" },
         // const _ = ._;
         // starlastoptional(.{.arg, _}, .{",", _});
@@ -651,7 +655,19 @@ pub fn main() !void {
         pub fn addsub(items: var, range: Range) addsub_RV {
             var result = items.get(0).value.value.*;
             for (items.get(1).value.value) |itm| {
+                // if(itm.value.get(0).value.value.*[0] == '+')
+                //    add
+                // else
+                //    subtract
                 result += itm.value.get(1).value.value.*;
+            }
+            return result;
+        }
+        pub const muldiv_RV = u64;
+        pub fn muldiv(items: var, range: Range) muldiv_RV {
+            var result = items.get(0).value.value.*;
+            for (items.get(1).value.value) |itm| {
+                result *= itm.value.get(1).value.value.*;
             }
             return result;
         }
@@ -690,7 +706,7 @@ pub fn main() !void {
     const res8 = (try parser.parse(.reftest, "====huh", Point.start, arena));
     std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
 
-    const mathequ = try parser.parse(.math, "1+3+2", Point.start, arena);
+    const mathequ = try parser.parse(.math, "1+3*2+2", Point.start, arena);
     std.debug.warn("math res: {}\n", .{mathequ.result.value.*});
-    testing.expectEqual(mathequ.result.value.*, 6);
+    testing.expectEqual(mathequ.result.value.*, 9);
 }
