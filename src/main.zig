@@ -1,5 +1,6 @@
 const std = @import("std");
 const meta = std.meta;
+const testing = std.testing;
 const Alloc = std.mem.Allocator;
 
 const OOM = Alloc.Error;
@@ -213,6 +214,7 @@ pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
         return std.fmt.bufPrint(&buf, fmt, arg) catch unreachable;
     }
 }
+//todo check seen and don't reprint infinitely
 pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8 {
     const indent = " " ** 4;
     const ti = @typeInfo(Type);
@@ -227,7 +229,7 @@ pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8
                 res = res ++ newline ++ indent ++ "const " ++ decl.name ++ ";";
             }
             res = res ++ newline ++ "}";
-            break :blk res;
+            break :blk @typeName(Type);
         },
         else => @typeName(Type),
     };
@@ -242,27 +244,14 @@ pub fn TypedList(comptime spec: []const ParseDetails) type {
     };
 }
 
-const testing = std.testing;
-test "l2i" {
-    comptime {
-        testing.expect(Log2Int(25) == u5);
-        testing.expect(Log2Int(16) == u4);
-        testing.expect(Log2Int(15) == u4);
-        testing.expect(Log2Int(17) == u5);
-        testing.expect(Log2Int(0) == u0);
-        testing.expect(Log2Int(1) == u0);
-        testing.expect(Log2Int(2) == u1);
-    }
-}
-
 // ideally, this would be a union(enum) created at comptime
 pub fn TypedUnion(comptime spec: []const ParseDetails) type {
     return struct {
         value: AnyPtr,
         range: Range,
-        index: std.math.Log2Int(0, spec.len - 1), // not really necessary, usize is basically the same
-        pub fn from(comptime idx: usize, value: *const spec[idx].ReturnType, range: Range) @This() {
-            return .{ .value = AnyPtr.fromPtr(value), .range = Range, .index = idx };
+        index: std.math.IntFittingRange(0, spec.len - 1), // not really necessary, usize is basically the same
+        pub fn from(comptime idx: usize, value: AnyPtr, range: Range) @This() {
+            return .{ .value = value, .range = range, .index = idx };
         }
         pub fn get(me: @This(), comptime idx: var) ?*const spec[idx].ReturnType {
             if (@typeInfo(@TypeOf(idx)) == .Struct) {
@@ -280,10 +269,12 @@ pub fn TypedUnion(comptime spec: []const ParseDetails) type {
         }
         pub fn any(me: @This()) *const spec[0].ReturnType {
             const MustMatch = spec[0].ReturnType;
-            for (spec) |itm| {
-                if (itm.ReturnType != MustMatch)
-                    @compileError("all possible values must be the same to use .any() on TypedUnion\n" ++
-                        "one was: " ++ typePrint(MustMatch) ++ "\nbut another was: " ++ typePrint(itm.ReturnType));
+            comptime {
+                for (spec) |itm| {
+                    if (itm.ReturnType != MustMatch)
+                        @compileError("all possible values must be the same to use .any() on TypedUnion\n" ++
+                            "one was: " ++ typePrint(MustMatch) ++ "\nbut another was: " ++ typePrint(itm.ReturnType));
+                }
             }
             return me.value.readAs(MustMatch);
         }
@@ -342,26 +333,25 @@ pub fn createOrParse(
 ) ParseDetails {
     const Union = TypedUnion(spec);
 
-    const Handler = CreateHandler(List, handler, HandlerReturnType);
+    const Handler = CreateHandler(Union, handler, HandlerReturnType);
 
     const parseFn = struct {
         fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
             const text = fulltext[start.byte..];
             var result: Union = undefined;
             inline for (spec) |specItem, i| {
-                const parseResult = try specItem.parse(fulltext, currentPoint, x);
-                if (parseResult == .errmsg)
-                    if (parseResult.errmsg.recoverable)
-                        continue
-                    else
+                const parseResult = try specItem.parse(fulltext, start, x);
+                if (parseResult == .errmsg) {
+                    if (!parseResult.errmsg.recoverable)
                         return parseResult;
-                result = Union.from(i, parseResult.result.value, parseResult.result.range);
+                } else
+                    result = Union.from(i, parseResult.result.value, parseResult.result.range);
             }
             // result.range shouldn't really exist but it's fine because it has to have some
             // data anyway
             var res = try x.alloc.create(Handler.Return);
             res.* = Handler.handle(result, result.range);
-            return returnValue(res, range);
+            return returnValue(res, result.range);
         }
     }.a;
 
@@ -416,6 +406,7 @@ pub fn isString(comptime SomeT: type) bool {
 pub const Or = struct {};
 
 pub fn userToReal(
+    comptime name: []const u8,
     comptime spec: var,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
@@ -429,11 +420,11 @@ pub fn userToReal(
         var orMatches: []const []const ParseDetails = &[_][]const ParseDetails{};
         var pdArray: []const ParseDetails = &[_]ParseDetails{};
         for (spec) |userItem, i| {
-            if (@TypeOf(userItem) == Or) {
+            if (@TypeOf(userItem) == type and userItem == Or) {
                 orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
                 pdArray = &[_]ParseDetails{};
-            }
-            pdArray = pdArray ++ [_]ParseDetails{userToReal(userItem, null, null, parseTypesMap)};
+            } else
+                pdArray = pdArray ++ [_]ParseDetails{userToReal(name, userItem, null, null, parseTypesMap)};
         }
         orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
         var allPMatches: []const ParseDetails = &[_]ParseDetails{};
@@ -461,7 +452,8 @@ pub fn userToReal(
     if (@TypeOf(Spec) == @TypeOf(.EnumLiteral) or std.mem.eql(u8, @typeName(Spec), "(enum literal)")) {
         return createFutureParse(spec, handler, HandlerReturnType, parseTypesMap);
     }
-    @compileError("Unsupported: " ++ @typeName(Spec));
+    @compileLog(spec);
+    @compileError("Unsupported: " ++ typePrint(Spec, 0) ++ " (named " ++ name ++ ")");
 }
 
 pub fn createParse(
@@ -471,7 +463,7 @@ pub fn createParse(
     comptime HandlerReturnType: ?type,
     comptime parseTypesMap: ComptimeHashMap([]const u8, TopLevelParseDetails),
 ) ParseDetails {
-    return comptime userToReal(spec, handler, HandlerReturnType, parseTypesMap);
+    return comptime userToReal(name, spec, handler, HandlerReturnType, parseTypesMap);
 }
 
 pub fn Parser(comptime spec: var, comptime Handlers: type) type {
@@ -553,6 +545,10 @@ const Ast = union(enum) {
     },
 };
 pub fn main() !void {
+    @compileError("main not implemented");
+}
+
+test "" {
     var alloc = std.heap.page_allocator;
     var arenaAllocator = std.heap.ArenaAllocator.init(alloc);
     defer arenaAllocator.deinit();
@@ -563,6 +559,9 @@ pub fn main() !void {
         .ordertest = .{ "test", "-", "interesting" },
         .nestedtest = .{ "one", .{ " ", "two" } },
         .reftest = .{ "=", .reftest }, // will always error but should be useful for testing before unions
+        .math = .addsub,
+        .addsub = .{ .number, .{ "+", Or, "-" }, .number },
+        .number = .{ "1", Or, "2", Or, "3" },
     }, struct {
         pub const stringtest_RV = []const u8;
         pub fn stringtest(text: var, range: Range) stringtest_RV {
@@ -580,7 +579,29 @@ pub fn main() !void {
         pub fn reftest(items: var, range: Range) reftest_RV {
             return 1;
         }
+        pub const math_RV = u64;
+        pub fn math(items: var, range: Range) math_RV {
+            return items.*;
+        }
+        pub const addsub_RV = u64;
+        pub fn addsub(items: var, range: Range) addsub_RV {
+            return items.get(0).value.value.* + items.get(2).value.value.*;
+        }
+        pub const number_RV = u64;
+        pub fn number(items: var, range: Range) number_RV {
+            const value = items.any();
+            if (std.mem.eql(u8, value.value, "1")) return 1;
+            if (std.mem.eql(u8, value.value, "2")) return 2;
+            if (std.mem.eql(u8, value.value, "3")) return 3;
+            unreachable;
+            // or go based on value.index, but this works too
+            // in js, I would do or(c`1`.scb(r => 1), c`2`.scb(r => 2), c`3`.scb(r => 3))
+            // is that better?
+        }
     });
+    testing.expect(
+        std.mem.eql(u8, (try parser.parse(.stringtest, "test", Point.start, arena)).result.value.*, "test"),
+    );
     const res = (try parser.parse(.stringtest, "test", Point.start, arena));
     std.debug.warn("res: {}\n", .{res.result.value.*});
     const res3 = (try parser.parse(.stringtest, "testing", Point.start, arena));
@@ -598,6 +619,8 @@ pub fn main() !void {
 
     const res8 = (try parser.parse(.reftest, "====huh", Point.start, arena));
     std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
-}
 
-test "" {}
+    const mathequ = try parser.parse(.math, "1+3", Point.start, arena);
+    std.debug.warn("math res: {}\n", .{mathequ.result.value.*});
+    testing.expectEqual(mathequ.result.value.*, 4);
+}

@@ -18,7 +18,7 @@
     {
       "label": "Test",
       "type": "shell",
-      "command": "zig test",
+      "command": "zig test src/main.zig",
       "problemMatcher": ["$gcc"]
     }
   ]
