@@ -235,11 +235,12 @@ pub fn CreateStringParse(
     };
 }
 pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
-    comptime {
-        const width = std.fmt.count(fmt, arg);
-        var buf: [width]u8 = undefined;
-        return std.fmt.bufPrint(&buf, fmt, arg) catch unreachable;
-    }
+    return "comptime fmt disabled";
+    // comptime {
+    //     const width = std.fmt.count(fmt, arg);
+    //     var buf: [width]u8 = undefined;
+    //     return std.fmt.bufPrint(&buf, fmt, arg) catch unreachable;
+    // }
 }
 //todo check seen and don't reprint infinitely
 pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8 {
@@ -330,7 +331,7 @@ pub fn TypedUnion(comptime spec: []const type) type {
                 inline for (idx) |iv, i| {
                     if (spec[i].ReturnType != MustMatch)
                         @compileError("All listed values must be the same to use .get(.{1, 2, 3...}).\none was: " ++
-                            typePrint(mustMatch) ++ ", but another was: " ++ typePrint(spec[i].ReturnType));
+                            typePrint(MustMatch, 0) ++ ", but another was: " ++ typePrint(spec[i].ReturnType, 0));
                     if (me.index == i)
                         break true;
                 } else return null;
@@ -338,15 +339,24 @@ pub fn TypedUnion(comptime spec: []const type) type {
             const details = spec[idx];
             return this.value.readAs(details.ReturnType).*;
         }
-        pub fn any(me: @This()) spec[0].ReturnType {
+        // has to be generic so the comptime doesn't run unless
+        // .any is actually used
+        /// pub fn any(me: Ths) spec[0].ReturnType
+        pub fn any(me_generic: var) spec[0].ReturnType {
             const MustMatch = spec[0].ReturnType;
             comptime {
                 for (spec) |itm| {
                     if (itm.ReturnType != MustMatch)
                         @compileError("all possible values must be the same to use .any() on TypedUnion\n" ++
-                            "one was: " ++ typePrint(MustMatch) ++ "\nbut another was: " ++ typePrint(itm.ReturnType));
+                            "one was: " ++ typePrint(MustMatch, 0) ++ "\nbut another was: " ++ typePrint(itm.ReturnType, 0));
                 }
             }
+            if (@typeInfo(@TypeOf(me_generic)) == .Pointer)
+                return realAny(me_generic.*);
+            return realAny(me_generic);
+        }
+        fn realAny(me: Ths) spec[0].ReturnType {
+            const MustMatch = spec[0].ReturnType;
             return me.value.readAs(MustMatch).*;
         }
     };
@@ -781,7 +791,7 @@ pub fn anotherTest() !void {
 
 pub fn main() !void {
     // takes a lot of eval branch quota because of things like the O(n) "hash"map
-    @setEvalBranchQuota(100_000);
+    @setEvalBranchQuota(10000000000000);
 
     var allocator = std.heap.page_allocator;
     var discardable = DiscardableAllocator.init(allocator);
@@ -796,6 +806,7 @@ pub fn main() !void {
         .addsub = .{ .muldiv, Star(.{ .{ "+", Or, "-" }, .muldiv }) },
         .muldiv = .{ .number, Star(.{ .{ "*", Or, "/" }, .number }) },
         .number = .{ "1", Or, "2", Or, "3" },
+        .sizetest = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
         // optional support next?
         // most of the places I use optional are starlastoptional
         // .{star(.{.expr, _, ",", _}), optional(.expr)}
@@ -860,6 +871,13 @@ pub fn main() !void {
             // it might be possible to make something slightly similar to that in zig, but
             // I do want to avoid inline functions because it makes the spec less clear.
         }
+        pub const sizetest_RV = u1;
+        // we could add something so you only need _RV
+        // if RV is provided but no fn, ensure the actual type
+        // matches what you wrote in rv and use that
+        pub fn sizetest(items: var, range: Range) u1 {
+            return 0;
+        }
     });
 
     try discardable.start();
@@ -888,4 +906,7 @@ pub fn main() !void {
     const mathequ = try parser.parse(.math, "1+3*2+2", Point.start, &discardable);
     std.debug.warn("math res: {}\n", .{mathequ.result.value});
     testing.expectEqual(mathequ.result.value, 9);
+
+    const sizetest = try parser.parse(.sizetest, "fail", Point.start, &discardable);
+    std.debug.warn("error: {}\n", .{sizetest.errmsg.message});
 }
