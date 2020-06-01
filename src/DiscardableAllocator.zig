@@ -9,6 +9,27 @@ child_allocator: *Allocator,
 arenas: std.ArrayList(std.heap.ArenaAllocator),
 flag_trash: bool,
 
+// could also have an interface where arenas are user controlled
+// let a1 = DiscardableAllocator.start()
+// a1.allocator
+// this current interface works well though as long as you don't want to backtrack
+// eg one case is in p()
+//     current = disc.start()
+//     if(err) {for(allocs) |alloc| disc.trashEnd(); current.end()}
+//     allocs.append(current)
+//   for(allocs) |alloc| alloc.end();
+// that way an error halfway through p() frees the things before it but
+// keeps the memory for the error
+// anyway, not really necessary right now
+//
+// maybe suggest stdlib to have an ArenaAllocator join method?
+// that does what the current .end() does?
+//
+// also it might be useful if this was backed by something like
+// arenaallocator but that actually supported freeing
+// just kept a list of memory to free and freed it on deinit, but
+// things could be freed early
+
 /// starts empty. make sure to call .start() before using
 pub fn init(child_allocator: *Allocator) DiscardableAllocator {
     return DiscardableAllocator{

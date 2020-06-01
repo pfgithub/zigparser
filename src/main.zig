@@ -488,15 +488,30 @@ pub fn isString(comptime SomeT: type) bool {
 // matches "1" | "2" | "34"
 pub const Or = struct {};
 
-pub fn star(comptime spec: var) type {
+pub fn Star(comptime spec: var) type {
     return struct {
         pub const __STAR_ARGS = spec;
+        pub const __REPEAT_MIN: usize = 0;
+        pub const __REPEAT_MAX: usize = std.math.maxInt(usize);
     };
 }
-pub fn CreateStarParse(
+pub fn Plus(comptime spec: var) type {
+    return struct {
+        pub const __STAR_ARGS = spec;
+        pub const __REPEAT_MIN: usize = 1;
+        pub const __REPEAT_MAX: usize = std.math.maxInt(usize);
+    };
+}
+// a*
+// a+
+// a{1,2}
+// do not use this for optionals, it's dumb for optionals to be arrays
+fn CreateRepeatedParse(
     comptime spec: type,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
+    comptime minCount: u64,
+    comptime maxCount: u64,
 ) type {
     const Handler = CreateHandler([]spec.ReturnType, handler, HandlerReturnType);
 
@@ -505,11 +520,18 @@ pub fn CreateStarParse(
             const text = fulltext[start.byte..];
             var fres = std.ArrayList(spec.ReturnType).init(x.alloc);
             var cpos: Point = start;
-            while (true) {
+            var index: usize = 0;
+            while (fres.items.len <= maxCount) : (index += 1) {
+                try x.discardable.start();
+                defer x.discardable.end();
+
                 const pres = try spec.parse(fulltext, cpos, x);
                 if (pres == .errmsg) {
-                    if (!pres.errmsg.recoverable)
+                    if (!pres.errmsg.recoverable or fres.items.len < minCount)
                         return Handler.errorCopy(pres.errmsg);
+                    x.discardable.trash(); // this error message is not used
+                    // so there is no reason to keep around all the junk memory
+                    // found in the process of creating this error
                     break;
                 }
                 cpos = pres.result.range.end;
@@ -519,6 +541,7 @@ pub fn CreateStarParse(
                 // imagine what terrible things we could do with operator overloading
                 // *?" " | ?(" ", "|", " ") | .someName
             }
+            if (fres.items.len < minCount) unreachable;
             const range = Range{ .start = start, .end = cpos };
             // here this can support plus with
             // if fres.len == 0 && isPlus
@@ -541,7 +564,7 @@ pub fn UserToReal(
         return CreateStringParse(@as([]const u8, spec), handler, HandlerReturnType);
     if (@typeInfo(Spec) == .Type and @typeInfo(spec) == .Struct and @hasDecl(spec, "__STAR_ARGS")) {
         const realArg = UserToReal(name ++ " > anon", spec.__STAR_ARGS, null, null, parseTypesMap);
-        return CreateStarParse(realArg, handler, HandlerReturnType);
+        return CreateRepeatedParse(realArg, handler, HandlerReturnType, spec.__REPEAT_MIN, spec.__REPEAT_MAX);
     }
     if (@typeInfo(Spec) == .Struct) {
         // oh no this is a bit of a mess because handler, HandlerReturnType has to be routed to only one thing
@@ -706,8 +729,8 @@ pub fn anotherTest() !void {
     };
     const parser = Parser(.{
         .math = .addsub,
-        .addsub = .{ .muldiv, star(.{ .{ "+", Or, "-" }, .muldiv }) },
-        .muldiv = .{ .number, star(.{ .{ "*", Or, "/" }, .number }) },
+        .addsub = .{ .muldiv, Star(.{ .{ "+", Or, "-" }, .muldiv }) },
+        .muldiv = .{ .number, Star(.{ .{ "*", Or, "/" }, .number }) },
         .number = .{plus(range('0', '9'))}, // fun! *const []const *const u8
         // even though often user code might want pointers, it's a good
         // idea for the user code to have to allocate explicitly except
@@ -770,8 +793,8 @@ pub fn main() !void {
         .nestedtest = .{ "one", .{ " ", "two" } },
         .reftest = .{ "=", .reftest }, // will always error but should be useful for testing before unions
         .math = .addsub,
-        .addsub = .{ .muldiv, star(.{ .{ "+", Or, "-" }, .muldiv }) },
-        .muldiv = .{ .number, star(.{ .{ "*", Or, "/" }, .number }) },
+        .addsub = .{ .muldiv, Star(.{ .{ "+", Or, "-" }, .muldiv }) },
+        .muldiv = .{ .number, Star(.{ .{ "*", Or, "/" }, .number }) },
         .number = .{ "1", Or, "2", Or, "3" },
         // optional support next?
         // most of the places I use optional are starlastoptional
