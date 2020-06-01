@@ -807,6 +807,11 @@ pub fn main() !void {
         .muldiv = .{ .number, Star(.{ .{ "*", Or, "/" }, .number }) },
         .number = .{ "1", Or, "2", Or, "3" },
         .sizetest = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
+        .sizetest2 = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
+        .sizetest3 = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
+        .sizetest4 = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
+        .sizetest5 = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
+        .sizetest6 = .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2", .{ "1", Or, "2" } } } } } } },
         // optional support next?
         // most of the places I use optional are starlastoptional
         // .{star(.{.expr, _, ",", _}), optional(.expr)}
@@ -871,11 +876,31 @@ pub fn main() !void {
             // it might be possible to make something slightly similar to that in zig, but
             // I do want to avoid inline functions because it makes the spec less clear.
         }
-        pub const sizetest_RV = u1;
         // we could add something so you only need _RV
         // if RV is provided but no fn, ensure the actual type
         // matches what you wrote in rv and use that
+        pub const sizetest_RV = u1;
         pub fn sizetest(items: var, range: Range) u1 {
+            return 0;
+        }
+        pub const sizetest2_RV = u1;
+        pub fn sizetest2(items: var, range: Range) u1 {
+            return 0;
+        }
+        pub const sizetest3_RV = u1;
+        pub fn sizetest3(items: var, range: Range) u1 {
+            return 0;
+        }
+        pub const sizetest4_RV = u1;
+        pub fn sizetest4(items: var, range: Range) u1 {
+            return 0;
+        }
+        pub const sizetest5_RV = u1;
+        pub fn sizetest5(items: var, range: Range) u1 {
+            return 0;
+        }
+        pub const sizetest6_RV = u1;
+        pub fn sizetest6(items: var, range: Range) u1 {
             return 0;
         }
     });
