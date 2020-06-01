@@ -235,6 +235,31 @@ pub fn CreateStringParse(
         pub const ReturnType = Handler.Return;
     };
 }
+pub fn CreateRangeParse(
+    comptime ranges: []const CharRange,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) type {
+    const Handler = CreateHandler(u8, handler, HandlerReturnType);
+
+    return struct {
+        pub fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
+            const text = fulltext[start.byte..];
+            if (text.len < 1) return Handler.errorValue("Expected char in range, got (too short)", start.extend("   "));
+            const char = text[0];
+            var pass = false; // once again, would use for else but no
+            inline for (ranges) |rng| {
+                if (char >= rng.start and char <= rng.end) {
+                    pass = true;
+                    break;
+                }
+            }
+            const range = start.extend(char);
+            return Handler.returnValue(char, range, x);
+        }
+        pub const ReturnType = Handler.Return;
+    };
+}
 pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
     return "comptime fmt disabled";
     // comptime {
@@ -470,6 +495,88 @@ pub fn CreateOrParse(
         pub const ReturnType = Handler.Return;
     };
 }
+pub fn CreateOptionalParse(
+    comptime spec: type,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) type {
+    const Result = ?spec.ReturnType;
+    const Handler = CreateHandler(Result, handler, HandlerReturnType);
+
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
+            const text = fulltext[start.byte..];
+            // would use for else, but that doesn't seem to like inline for very much
+            var result: ?Result = null;
+            const parseResult = try specItem.parse(fulltext, start, x);
+            if (parseResult == .errmsg)
+                if (!parseResult.errmsg.recoverable)
+                    return Handler.errorCopy(parseResult.errmsg)
+                else
+                    result = null
+            else
+                result = parseResult.result.value;
+            return Handler.returnValue(result, result.range, x);
+        }
+        pub const ReturnType = Handler.Return;
+    };
+}
+pub fn CreateRequiredParse(
+    comptime spec: type,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) type {
+    const Result = spec.ReturnType;
+    const Handler = CreateHandler(Result, handler, HandlerReturnType);
+
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
+            const text = fulltext[start.byte..];
+            // would use for else, but that doesn't seem to like inline for very much
+            var result: ?Result = null;
+            const parseResult = try specItem.parse(fulltext, start, x);
+            if (parseResult == .errmsg)
+                return Handler.errorCopy(parseResult.errmsg)
+            else {
+                if (parseResult.result.range.start.byte == parseResult.result.range.end.byte)
+                    return Handler.errorValue("Missing required", start.extend("  "));
+                // extend "  " is kind of bad because it can make wrong positions sometimes
+                result = parseResult.result.value;
+            }
+            return Handler.returnValue(result, result.range, x);
+        }
+        pub const ReturnType = Handler.Return;
+    };
+}
+pub fn CreateNotParse(
+    comptime spec: type,
+    comptime handler: var,
+    comptime HandlerReturnType: ?type,
+) type {
+    const Result = void;
+    const Handler = CreateHandler(Result, handler, HandlerReturnType);
+
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
+            discardable.start();
+            defer discardable.end();
+
+            const text = fulltext[start.byte..];
+            // would use for else, but that doesn't seem to like inline for very much
+            const parseResult = try specItem.parse(fulltext, start, x);
+            if (parseResult == .errmsg) {
+                if (!parseResult.errmsg.recoverable)
+                    return Handler.errorCopy(parseResult.errmsg);
+            } else {
+                discardable.trash(); // maybe any things after this should go into an allocator that is not trashed instead of unreachable
+                // that way, if we needed to, we could allocate memory here and it would not be discarded on .end();
+                return Handler.errorValue("Unexpected match", parseResult.result.range);
+            }
+            return Handler.returnValue({}, result.range, x);
+        }
+        pub const ReturnType = Handler.Return;
+    };
+}
 
 pub fn CreateFutureParse(
     comptime spec: var,
@@ -509,6 +616,7 @@ pub fn isString(comptime SomeT: type) bool {
 // matches "1" | "2" | "34"
 pub const Or = struct {};
 
+/// match zero or more parses -> []T
 pub fn Star(comptime spec: var) type {
     return struct {
         pub const __STAR_ARGS = spec;
@@ -516,11 +624,66 @@ pub fn Star(comptime spec: var) type {
         pub const __REPEAT_MAX: usize = std.math.maxInt(usize);
     };
 }
+/// match one or more parses -> []T
 pub fn Plus(comptime spec: var) type {
     return struct {
         pub const __STAR_ARGS = spec;
         pub const __REPEAT_MIN: usize = 1;
         pub const __REPEAT_MAX: usize = std.math.maxInt(usize);
+    };
+}
+/// match a single parse, or not -> ?T
+pub fn Optional(comptime spec: var) type {
+    return struct {
+        pub const __OPTIONAL_ARGS = spec;
+    };
+}
+/// ensure that a given parse does not match -> void
+pub fn Not(comptime spec: var) type {
+    return struct {
+        pub const __NOT_ARGS = spec;
+    };
+}
+const CharRange = struct { start: u8, end: u8 };
+// Char(.{.{'1', '9'}, .{'a', 'z'}, .{'A', 'Z'}});
+// this vs
+// .{'1', To, '9', Or, 'a', To, 'z', Or, 'A', To, 'Z'}
+// vs
+// .{Char('1', '9'), Or, Char('a', 'z'), Or, Char('A', 'Z')}
+//
+// the reason for the first one is to make it easier to implement an exclude
+// NotChar('\\')
+//
+// all this vs
+// regex(\\[1-9a-zA-Z]
+// )
+//
+// char + notchar is probably better
+// how about not()
+// matches .{0} that does not match first arg
+// Not(.{Char('1', '9')}), AnyChar()
+// :: matches [^1-9]
+// Star(.{Not(.{Char('1', '9')}), AnyChar()})
+// :: matches [^1-9]*
+// what if Char{1, 2} was a thing? unfortunately it isn't and can't be
+// (#issue about constant stuff) but that would be neat
+
+/// match a single char in the range start-end -> u8
+pub fn Char(comptime start: u8, comptime end: u8) type {
+    return struct {
+        pub const __CHAR_RANGES: []const CharRange = &[_]CharRange{CharRange{ .start = start, .end = end }};
+    };
+}
+/// match any character -> u8
+pub fn AnyChar() type {
+    return struct {
+        pub const __CHAR_RANGES: []const CharRange = &[_]CharRange{CharRange{ .start = 0, .end = 255 }};
+    };
+}
+/// match a single char in one of the provided ranges -> u8
+pub fn CharRanges(comptime ranges: []const CharRange) type {
+    return struct {
+        pub const __CHAR_RANGES: []const CharRange = ranges;
     };
 }
 // a*
@@ -583,9 +746,23 @@ pub fn UserToReal(
     const Spec = @TypeOf(spec);
     if (isString(Spec))
         return CreateStringParse(@as([]const u8, spec), handler, HandlerReturnType);
-    if (@typeInfo(Spec) == .Type and @typeInfo(spec) == .Struct and @hasDecl(spec, "__STAR_ARGS")) {
-        const realArg = UserToReal(name ++ " > anon", spec.__STAR_ARGS, null, null, parseTypesMap);
-        return CreateRepeatedParse(realArg, handler, HandlerReturnType, spec.__REPEAT_MIN, spec.__REPEAT_MAX);
+    if (@typeInfo(Spec) == .Type and @typeInfo(spec) == .Struct) {
+        if (@hasDecl(spec, "__STAR_ARGS")) {
+            const realArg = UserToReal(name ++ " > anon", spec.__STAR_ARGS, null, null, parseTypesMap);
+            return CreateRepeatedParse(realArg, handler, HandlerReturnType, spec.__REPEAT_MIN, spec.__REPEAT_MAX);
+        }
+        if (@hasDecl(spec, "__OPTIONAL_ARGS")) {
+            const realArg = userToReal(name ++ " > anon", spec.__OPTIONAL_ARGS, null, null, parseTypesMap);
+            return CreateOptionalParse(realArg, handler, HandlerReturnType);
+        }
+        if (@hasDecl(spec, "__NOT_ARGS")) {
+            const realArg = userToReal(name ++ " > anon", spec.__NOT_ARGS, null, null, parseTypesMap);
+            return CreateNotParse(realArg, handler, HandlerReturnType);
+        }
+        if (@hasDecl(spec, "__CHAR_RANGES")) {
+            return CreateRangeParse(spec.__CHAR_RANGES, handler, HandlerReturnType);
+        }
+        @compileError("wrong");
     }
     if (@typeInfo(Spec) == .Struct) {
         // oh no this is a bit of a mess because handler, HandlerReturnType has to be routed to only one thing
