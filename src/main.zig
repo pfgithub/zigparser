@@ -790,6 +790,21 @@ pub fn anotherTest() !void {
 }
 
 pub fn main() !void {
+    try demotest();
+}
+
+fn timetest() !void {
+    const count = 10000;
+    var i: u64 = 0;
+    const start = try std.time.Timer.start();
+    while (i < count) : (i += 1) {
+        try demotest();
+    }
+    const end = start.read();
+    std.debug.warn("Took ~{d:.04}ms/i\n", .{@intToFloat(f64, end) / @intToFloat(f64, count) / 1_000_000});
+}
+
+fn demotest() !void {
     // takes a lot of eval branch quota because of things like the O(n) "hash"map
     @setEvalBranchQuota(10000000000000);
 
@@ -910,28 +925,27 @@ pub fn main() !void {
     testing.expect(
         std.mem.eql(u8, (try parser.parse(.stringtest, "test", Point.start, &discardable)).result.value, "test"),
     );
-    const res = try parser.parse(.stringtest, "test", Point.start, &discardable);
-    std.debug.warn("res: {}\n", .{res.result.value});
-    const res3 = try parser.parse(.stringtest, "testing", Point.start, &discardable);
-    std.debug.warn("res: {}, rng: {}\n", .{ res3.result.value, res3.result.range });
-    const res2 = try parser.parse(.stringtest, "tst", Point.start, &discardable);
-    std.debug.warn("err: {}\n", .{res2.errmsg.message});
+    // const res = try parser.parse(.stringtest, "test", Point.start, &discardable);
 
-    const res4 = try parser.parse(.ordertest, "test-interesting", Point.start, &discardable);
-    std.debug.warn("res: {}\n", .{res4.result.value});
-    const res5 = try parser.parse(.ordertest, "test!interesting", Point.start, &discardable);
-    std.debug.warn("res: {}, rng: {}\n", .{ res5.errmsg.message, res5.errmsg.range });
+    // const res3 = try parser.parse(.stringtest, "testing", Point.start, &discardable);
+    // std.debug.warn("res: {}, rng: {}\n", .{ res3.result.value, res3.result.range });
+    // const res2 = try parser.parse(.stringtest, "tst", Point.start, &discardable);
+    // std.debug.warn("err: {}\n", .{res2.errmsg.message});
 
-    const res7 = try parser.parse(.nestedtest, "one two", Point.start, &discardable);
-    std.debug.warn("res7: {}\n", .{res7.result.value});
+    // const res4 = try parser.parse(.ordertest, "test-interesting", Point.start, &discardable);
+    // std.debug.warn("res: {}\n", .{res4.result.value});
+    // const res5 = try parser.parse(.ordertest, "test!interesting", Point.start, &discardable);
+    // std.debug.warn("res: {}, rng: {}\n", .{ res5.errmsg.message, res5.errmsg.range });
 
-    const res8 = try parser.parse(.reftest, "====huh", Point.start, &discardable);
-    std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
+    // const res7 = try parser.parse(.nestedtest, "one two", Point.start, &discardable);
+    // std.debug.warn("res7: {}\n", .{res7.result.value});
+
+    // const res8 = try parser.parse(.reftest, "====huh", Point.start, &discardable);
+    // std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
 
     const mathequ = try parser.parse(.math, "1+3*2+2", Point.start, &discardable);
-    std.debug.warn("math res: {}\n", .{mathequ.result.value});
     testing.expectEqual(mathequ.result.value, 9);
 
-    const sizetest = try parser.parse(.sizetest, "fail", Point.start, &discardable);
-    std.debug.warn("error: {}\n", .{sizetest.errmsg.message});
+    // const sizetest = try parser.parse(.sizetest, "fail", Point.start, &discardable);
+    // std.debug.warn("error: {}\n", .{sizetest.errmsg.message});
 }
