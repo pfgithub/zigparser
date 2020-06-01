@@ -10,7 +10,7 @@ const OOM = Alloc.Error;
 /// so this works I guess.
 ///
 /// comptime "hash"map. all accesses and sets are ~~O(1)~~ O(n)
-pub fn ComptimeHashMap(comptime Key: type, comptime Value: type) type {
+fn ComptimeHashMap(comptime Key: type, comptime Value: type) type {
     const Item = struct { key: Key, value: Value };
     return struct {
         const HM = @This();
@@ -76,7 +76,7 @@ const TypeIDMap = struct {
     }
 };
 
-const Point = struct {
+pub const Point = struct {
     byte: u64,
     line: u64,
     char: u64,
@@ -94,13 +94,9 @@ const Point = struct {
         return .{ .start = start_, .end = end };
     }
 };
-const Range = struct {
+pub const Range = struct {
     start: Point,
     end: Point,
-    pub const todo = Range{
-        .start = .{ .byte = 0, .line = 0, .char = 0 },
-        .end = .{ .byte = 0, .line = 0, .char = 0 },
-    };
 };
 /// a pointer to arbitrary data. panics if attempted to be read as the wrong type.
 const AnyPtr = comptime blk: {
@@ -140,17 +136,22 @@ const ParseResult = union(enum) {
     },
     errmsg: ErrResult,
 };
-const ParseFn = fn (text: []const u8, start: Point, x: Extra) OOM!ParseResult;
+const ParseFn = fn (text: []const u8, start: Point, x: InternalExtra) OOM!ParseResult;
 const TopLevelParseDetails = struct {
     details: ?type,
     ReturnType: type,
     index: usize,
 };
 
-const Extra = struct {
+const InternalExtra = struct {
     alloc: *Alloc,
     discardable: *DiscardableAllocator,
     parseFns: []const ParseFn,
+};
+pub const Extra = struct {
+    range: Range,
+    alloc: *Alloc,
+    discardable: *DiscardableAllocator,
 };
 
 fn ErrorOr(comptime Type: type) type {
@@ -188,7 +189,7 @@ fn ErrorOr(comptime Type: type) type {
 // are only used by futureParses.
 fn createParseFn(comptime parseDetails: type) ParseFn {
     return struct {
-        pub fn f(text: []const u8, start: Point, x: Extra) OOM!ParseResult {
+        pub fn f(text: []const u8, start: Point, x: InternalExtra) OOM!ParseResult {
             const result = try parseDetails.parse(text, start, x);
             if (result == .errmsg) {
                 return ParseResult{ .errmsg = result.errmsg };
@@ -213,7 +214,7 @@ pub fn CreateStringParse(
     const Handler = CreateHandler([]const u8, handler, HandlerReturnType);
 
     return struct {
-        pub fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
+        pub fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
             if (text.len < spec.len)
                 return Handler.errorValue(
@@ -229,7 +230,7 @@ pub fn CreateStringParse(
             }
             const range = start.extend(spec);
             const strCopy = try std.mem.dupe(x.alloc, u8, spec);
-            return Handler.returnValue(strCopy, range);
+            return Handler.returnValue(strCopy, range, x);
         }
         pub const ReturnType = Handler.Return;
     };
@@ -366,11 +367,17 @@ pub fn CreateHandler(comptime Arg0: type, comptime handler: var, comptime Handle
     return struct {
         pub const Return = HandlerReturnType orelse DefaultReturnType;
         pub const FnReturn = ErrorOr(Return);
-        pub fn handle(value: Arg0, range: Range) Return {
-            if (HandlerReturnType == null) {
+        pub fn handle(value: Arg0, x: Extra) OOM!Return {
+            if (@TypeOf(handler) == @TypeOf(null)) {
                 return value; // f range. you will not be missed.
             } else {
-                return handler(value, range);
+                const argslen = @typeInfo(@TypeOf(handler)).Fn.args.len;
+                if (argslen == 2)
+                    return handler(value, x)
+                else if (argslen == 1)
+                    return handler(value)
+                else
+                    @compileError("wrong number of arguments");
             }
         }
 
@@ -386,10 +393,14 @@ pub fn CreateHandler(comptime Arg0: type, comptime handler: var, comptime Handle
         pub fn errorCopy(e: ErrResult) FnReturn {
             return .{ .errmsg = e };
         }
-        pub fn returnValue(value: var, range: Range) FnReturn {
+        pub fn returnValue(value: var, range: Range, x: InternalExtra) OOM!FnReturn {
             return FnReturn{
                 .result = .{
-                    .value = handle(value, range),
+                    .value = try handle(value, .{
+                        .range = range,
+                        .alloc = x.alloc,
+                        .discardable = x.discardable,
+                    }),
                     .range = range,
                 },
             };
@@ -407,7 +418,7 @@ pub fn CreateOrderedParse(
     const Handler = CreateHandler(List, handler, HandlerReturnType);
 
     return struct {
-        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
             var result: List = .{ .range = undefined };
             var currentPoint: Point = start;
@@ -423,7 +434,7 @@ pub fn CreateOrderedParse(
 
             const range: Range = .{ .start = start, .end = currentPoint };
             result.range = range;
-            return Handler.returnValue(result, range);
+            return Handler.returnValue(result, range, x);
         }
         pub const ReturnType = Handler.Return;
     };
@@ -437,7 +448,7 @@ pub fn CreateOrParse(
     const Handler = CreateHandler(Union, handler, HandlerReturnType);
 
     return struct {
-        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
             // would use for else, but that doesn't seem to like inline for very much
             var resultOpt: ?Union = null;
@@ -454,7 +465,7 @@ pub fn CreateOrParse(
                     resultOpt = try Union.from(i, parseResult.result.value, parseResult.result.range, x.alloc);
             }
             const result = resultOpt orelse return Handler.errorValue("all ors failed", start.extend("  "));
-            return Handler.returnValue(result, result.range);
+            return Handler.returnValue(result, result.range, x);
         }
         pub const ReturnType = Handler.Return;
     };
@@ -471,13 +482,13 @@ pub fn CreateFutureParse(
     const Handler = CreateHandler(*const resultDetails.ReturnType, handler, HandlerReturnType);
 
     return struct {
-        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
             const parseResult = try x.parseFns[resultDetails.index](fulltext, start, x);
             if (parseResult == .errmsg) return Handler.errorCopy(parseResult.errmsg);
             const result = parseResult.result.value.readAs(resultDetails.ReturnType);
             const range = parseResult.result.range;
 
-            return Handler.returnValue(result, range);
+            return Handler.returnValue(result, range, x);
         }
         pub const ReturnType = Handler.Return;
     };
@@ -526,7 +537,7 @@ fn CreateRepeatedParse(
     const Handler = CreateHandler([]spec.ReturnType, handler, HandlerReturnType);
 
     return struct {
-        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
+        fn parse(fulltext: []const u8, start: Point, x: InternalExtra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
             var fres = std.ArrayList(spec.ReturnType).init(x.alloc);
             var cpos: Point = start;
@@ -556,7 +567,7 @@ fn CreateRepeatedParse(
             // here this can support plus with
             // if fres.len == 0 && isPlus
             //     return error
-            return Handler.returnValue(fres.toOwnedSlice(), range);
+            return Handler.returnValue(fres.toOwnedSlice(), range, x);
         }
         pub const ReturnType = Handler.Return;
     };
@@ -683,7 +694,7 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
                 errmsg: ErrResult,
             } {
                 const parseDetails = parses.get(@tagName(key)).?;
-                const xtra: Extra = .{
+                const xtra: InternalExtra = .{
                     .alloc = &discardable.allocator,
                     .discardable = discardable,
                     .parseFns = &parseFns,
@@ -754,7 +765,7 @@ pub fn anotherTest() !void {
             return items.get(0); // .getpos for positions
         }
         pub const addsub_RV = Expr;
-        // items: var, x: Extra incl range and alloc?
+        // items: var, x: InternalExtra incl range and alloc?
         // what if instead of .get/.getrange there was a seperate
         // range() that returned {value: ?, range: Range}
         // and then there wasn't the mess of .value.value.value
@@ -839,27 +850,27 @@ fn demotest() !void {
         // starlastoptional(.{.arg, _}, .{",", _});
     }, struct {
         pub const stringtest_RV = []const u8;
-        pub fn stringtest(text: var, range: Range) stringtest_RV {
+        pub fn stringtest(text: var, x: Extra) stringtest_RV {
             return text;
         }
         pub const ordertest_RV = u1;
-        pub fn ordertest(items: var, range: Range) ordertest_RV {
+        pub fn ordertest(items: var, x: Extra) ordertest_RV {
             return 0;
         }
         pub const nestedtest_RV = []const u8;
-        pub fn nestedtest(items: var, range: Range) []const u8 {
+        pub fn nestedtest(items: var, x: Extra) []const u8 {
             return items.get(0);
         }
         pub const reftest_RV = u1;
-        pub fn reftest(items: var, range: Range) reftest_RV {
+        pub fn reftest(items: var, x: Extra) reftest_RV {
             return 1;
         }
         pub const math_RV = u64;
-        pub fn math(items: var, range: Range) math_RV {
+        pub fn math(items: var, x: Extra) math_RV {
             return items.*;
         }
         pub const addsub_RV = u64;
-        pub fn addsub(items: var, range: Range) addsub_RV {
+        pub fn addsub(items: var, x: Extra) addsub_RV {
             var result = items.get(0).*;
             for (items.get(1)) |itm| {
                 // if(itm.value.get(0).value.value.*[0] == '+')
@@ -871,7 +882,7 @@ fn demotest() !void {
             return result;
         }
         pub const muldiv_RV = u64;
-        pub fn muldiv(items: var, range: Range) muldiv_RV {
+        pub fn muldiv(items: var, x: Extra) muldiv_RV {
             var result = items.get(0).*;
             for (items.get(1)) |itm| {
                 result *= itm.get(1).*;
@@ -879,7 +890,7 @@ fn demotest() !void {
             return result;
         }
         pub const number_RV = u64;
-        pub fn number(items: var, range: Range) number_RV {
+        pub fn number(items: var, x: Extra) number_RV {
             const value = items.any();
             if (std.mem.eql(u8, value, "1")) return 1;
             if (std.mem.eql(u8, value, "2")) return 2;
@@ -895,27 +906,27 @@ fn demotest() !void {
         // if RV is provided but no fn, ensure the actual type
         // matches what you wrote in rv and use that
         pub const sizetest_RV = u1;
-        pub fn sizetest(items: var, range: Range) u1 {
+        pub fn sizetest(items: var, x: Extra) u1 {
             return 0;
         }
         pub const sizetest2_RV = u1;
-        pub fn sizetest2(items: var, range: Range) u1 {
+        pub fn sizetest2(items: var, x: Extra) u1 {
             return 0;
         }
         pub const sizetest3_RV = u1;
-        pub fn sizetest3(items: var, range: Range) u1 {
+        pub fn sizetest3(items: var, x: Extra) u1 {
             return 0;
         }
         pub const sizetest4_RV = u1;
-        pub fn sizetest4(items: var, range: Range) u1 {
+        pub fn sizetest4(items: var, x: Extra) u1 {
             return 0;
         }
         pub const sizetest5_RV = u1;
-        pub fn sizetest5(items: var, range: Range) u1 {
+        pub fn sizetest5(items: var, x: Extra) u1 {
             return 0;
         }
         pub const sizetest6_RV = u1;
-        pub fn sizetest6(items: var, range: Range) u1 {
+        pub fn sizetest6(items: var, x: Extra) u1 {
             return 0;
         }
     });
