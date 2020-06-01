@@ -140,12 +140,8 @@ const ParseResult = union(enum) {
     errmsg: ErrResult,
 };
 const ParseFn = fn (text: []const u8, start: Point, x: Extra) OOM!ParseResult;
-const ParseDetails = struct {
-    parse: ParseFn,
-    ReturnType: type,
-};
 const TopLevelParseDetails = struct {
-    parse: ?ParseFn,
+    details: ?type,
     ReturnType: type,
     index: usize,
 };
@@ -155,56 +151,85 @@ const Extra = struct {
     parseFns: []const ParseFn,
 };
 
-fn errorValue(emsg: []const u8, range: Range) ParseResult {
-    return .{
-        .errmsg = .{
-            .message = emsg,
-            .range = range,
-            .recoverable = true,
+fn ErrorOr(comptime Type: type) type {
+    return union(enum) {
+        result: struct {
+            value: Type,
+            range: Range,
+            // only the value should get passed
+            // to the handler
         },
-    };
-}
-fn returnValue(value: var, range: Range) ParseResult {
-    return .{
-        .result = .{
-            .value = AnyPtr.fromPtr(value),
-            .range = range,
-        },
+        errmsg: ErrResult,
     };
 }
 
-pub fn createStringParse(
+// unrelated note how to fix memory leaks:
+// require _RV struct/enum/unions to have a deinit method
+// disallow pointers in _RV
+// that would be annoying though so arena allocator is fine for now
+// or, at no cost to the user:
+// temporaryallocator
+//
+// talloc = TemporaryAllocator(std.heap.page_allocator);
+// var tblk = talloc.start();
+//   // attempt to parse some item in union
+// if(err) tblk.trash();
+// tblk.end();
+//
+// that would work well and not require the user to do anything
+// neat
+
+// with this new system, ranges won't be given any more by default
+// so there will need to be a range() to use if you need a range for
+// some reason.
+// pointers are only created with runtime parse fns (vvv) which
+// are only used by futureParses.
+fn createParseFn(comptime parseDetails: type) ParseFn {
+    return struct {
+        pub fn f(text: []const u8, start: Point, x: Extra) OOM!ParseResult {
+            const result = try parseDetails.parse(text, start, x);
+            if (result == .errmsg) {
+                return ParseResult{ .errmsg = result.errmsg };
+            }
+            const allocatedResult = try x.alloc.create(@TypeOf(result.result.value));
+            allocatedResult.* = result.result.value;
+            return ParseResult{
+                .result = .{
+                    .value = AnyPtr.fromPtr(allocatedResult),
+                    .range = result.result.range,
+                },
+            };
+        }
+    }.f;
+}
+
+pub fn CreateStringParse(
     comptime spec: []const u8,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
-) ParseDetails {
+) type {
     const Handler = CreateHandler([]const u8, handler, HandlerReturnType);
 
-    const parseFn: ParseFn = struct {
-        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+    return struct {
+        pub fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
             if (text.len < spec.len)
-                return errorValue(
+                return Handler.errorValue(
                     "Expected `" ++ spec ++ "` (too short)",
                     start.extend("  "),
                 );
             for (spec) |char, i| {
                 if (char != text[i])
-                    return errorValue(
+                    return Handler.errorValue(
                         "Expected `" ++ spec ++ "`",
                         start.extend("  "),
                     );
             }
             const range = start.extend(spec);
             const strCopy = try std.mem.dupe(x.alloc, u8, spec);
-            var res = try x.alloc.create(Handler.Return);
-            res.* = Handler.handle(strCopy, range);
-            return returnValue(res, range);
+            return Handler.returnValue(strCopy, range);
         }
-    }.a;
-    return ParseDetails{
-        .parse = parseFn,
-        .ReturnType = Handler.Return,
+        pub const ReturnType = Handler.Return;
     };
 }
 pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
@@ -216,6 +241,7 @@ pub fn comptimeFmt(comptime fmt: []const u8, comptime arg: var) []const u8 {
 }
 //todo check seen and don't reprint infinitely
 pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8 {
+    if (indentationLevel > 10) return "..."; // good enough
     const indent = " " ** 4;
     const ti = @typeInfo(Type);
     return switch (ti) {
@@ -234,26 +260,69 @@ pub fn typePrint(comptime Type: type, comptime indentationLevel: u64) []const u8
         else => @typeName(Type),
     };
 }
+/// hmm...
+pub fn CreateTuple(comptime items: var) type {
+    const oft = struct {
+        fn oft(comptime T: type) T {
+            return undefined;
+        }
+    }.oft;
+    var resultTuple: type = @TypeOf(.{});
+    for (items) |Item| {
+        resultTuple = @TypeOf(oft(resultTuple) ++ .{oft(Item)});
+    }
+    return resultTuple;
+}
+// rip:
+// test "createTuple" {
+//     const Q = CreateTuple(.{ i32, i64, []const u8 });
+//     var q: Q = undefined;
+//     // f these are const: (#5486)
+//     q[0] = 5;
+//     q[1] = 10;
+//     q[2] = "test";
+// }
+// staying with []AnyPtr until @Type(structs/tuples) I guess
+
 // ideally, this would be a tuple created at comptime
-pub fn TypedList(comptime spec: []const ParseDetails) type {
+// and with the above CreateTuple function that can almost be accomplished
+// unfortunately, https://github.com/ziglang/zig/issues/5486
+pub fn TypedList(comptime spec: []const type) type {
     return struct {
         items: [spec.len]struct { value: AnyPtr, range: Range } = undefined,
-        pub fn get(list: @This(), comptime index: u64) struct { value: *const spec[index].ReturnType, range: Range } {
-            return .{ .value = list.items[index].value.readAs(spec[index].ReturnType), .range = list.items[index].range };
+        range: Range, // although I'm getting rid of ranges, if .get() is required anyway why not include a range
+        pub fn get(list: @This(), comptime index: u64) spec[index].ReturnType {
+            return list.items[index].value.readAs(spec[index].ReturnType).*;
+        }
+        // is this necessary? wouldn't range(SomeParse) be better? and then this could just be []AnyPtr
+        // until comptime tuple creation is available?
+        pub fn getRange(list: @This(), index: u64) Range {
+            return list.items[index].range;
+        }
+        pub fn set(list: *@This(), i: usize, value: var, range: Range, alloc: *Alloc) OOM!void {
+            var allocatedValue = try alloc.create(@TypeOf(value));
+            allocatedValue.* = value;
+            list.items[i] = .{ .value = AnyPtr.fromPtr(allocatedValue), .range = range };
         }
     };
 }
 
 // ideally, this would be a union(enum) created at comptime
-pub fn TypedUnion(comptime spec: []const ParseDetails) type {
+// might have some extra space but probably better than
+// allocating for everything stored in a union
+pub fn TypedUnion(comptime spec: []const type) type {
     return struct {
         value: AnyPtr,
-        range: Range,
+        range: Range, // same as above
         index: std.math.IntFittingRange(0, spec.len - 1), // not really necessary, usize is basically the same
-        pub fn from(comptime idx: usize, value: AnyPtr, range: Range) @This() {
-            return .{ .value = value, .range = range, .index = idx };
+        const Ths = @This();
+        pub fn from(comptime idx: usize, value: var, range: Range, alloc: *Alloc) OOM!Ths {
+            if (@TypeOf(value) != spec[idx].ReturnType) @compileError("wrong");
+            var allocatedValue = try alloc.create(@TypeOf(value));
+            allocatedValue.* = value;
+            return Ths{ .value = AnyPtr.fromPtr(allocatedValue), .range = range, .index = idx };
         }
-        pub fn get(me: @This(), comptime idx: var) ?*const spec[idx].ReturnType {
+        pub fn get(me: @This(), comptime idx: var) ?spec[idx].ReturnType {
             if (@typeInfo(@TypeOf(idx)) == .Struct) {
                 const MustMatch = spec[idx[0]].ReturnType;
                 inline for (idx) |iv, i| {
@@ -265,9 +334,9 @@ pub fn TypedUnion(comptime spec: []const ParseDetails) type {
                 } else return null;
             } else if (me.index != idx) return null;
             const details = spec[idx];
-            return this.value.readAs(details.ReturnType);
+            return this.value.readAs(details.ReturnType).*;
         }
-        pub fn any(me: @This()) *const spec[0].ReturnType {
+        pub fn any(me: @This()) spec[0].ReturnType {
             const MustMatch = spec[0].ReturnType;
             comptime {
                 for (spec) |itm| {
@@ -276,67 +345,87 @@ pub fn TypedUnion(comptime spec: []const ParseDetails) type {
                             "one was: " ++ typePrint(MustMatch) ++ "\nbut another was: " ++ typePrint(itm.ReturnType));
                 }
             }
-            return me.value.readAs(MustMatch);
+            return me.value.readAs(MustMatch).*;
         }
     };
 }
 pub fn CreateHandler(comptime Arg0: type, comptime handler: var, comptime HandlerReturnType: ?type) type {
-    const DefaultReturnType = struct { value: Arg0, range: Range };
+    const DefaultReturnType = Arg0;
     return struct {
         pub const Return = HandlerReturnType orelse DefaultReturnType;
+        pub const FnReturn = ErrorOr(Return);
         pub fn handle(value: Arg0, range: Range) Return {
             if (HandlerReturnType == null) {
-                return .{ .value = value, .range = range };
+                return value; // f range. you will not be missed.
             } else {
                 return handler(value, range);
             }
         }
+
+        pub fn errorValue(emsg: []const u8, range: Range) FnReturn {
+            return FnReturn{
+                .errmsg = .{
+                    .message = emsg,
+                    .range = range,
+                    .recoverable = true,
+                },
+            };
+        }
+        pub fn errorCopy(e: ErrResult) FnReturn {
+            return .{ .errmsg = e };
+        }
+        pub fn returnValue(value: var, range: Range) FnReturn {
+            return FnReturn{
+                .result = .{
+                    .value = handle(value, range),
+                    .range = range,
+                },
+            };
+        }
     };
 }
-pub fn createOrderedParse(
-    comptime spec: []const ParseDetails,
+
+pub fn CreateOrderedParse(
+    comptime spec: []const type,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
-) ParseDetails {
+) type {
     const List = TypedList(spec);
 
     const Handler = CreateHandler(List, handler, HandlerReturnType);
 
-    const parseFn = struct {
-        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
-            var result: List = .{};
+            var result: List = .{ .range = undefined };
             var currentPoint: Point = start;
             inline for (spec) |specItem, i| {
                 const parseResult = try specItem.parse(fulltext, currentPoint, x);
-                if (parseResult == .errmsg) return parseResult;
+                if (parseResult == .errmsg) return Handler.errorCopy(parseResult.errmsg);
                 currentPoint = parseResult.result.range.end;
-                result.items[i] = .{ .value = parseResult.result.value, .range = parseResult.result.range };
+                // uh oh items[i] is not going to be of the right type
+                // oops
+                // f this is going to allocate until we can create tuples at comptime
+                try result.set(i, parseResult.result.value, parseResult.result.range, x.alloc);
             }
 
             const range: Range = .{ .start = start, .end = currentPoint };
-            var res = try x.alloc.create(Handler.Return);
-            res.* = Handler.handle(result, range);
-            return returnValue(res, range);
+            result.range = range;
+            return Handler.returnValue(result, range);
         }
-    }.a;
-
-    return ParseDetails{
-        .parse = parseFn,
-        .ReturnType = Handler.Return,
+        pub const ReturnType = Handler.Return;
     };
 }
-pub fn createOrParse(
-    comptime spec: []const ParseDetails,
+pub fn CreateOrParse(
+    comptime spec: []const type,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
-) ParseDetails {
+) type {
     const Union = TypedUnion(spec);
-
     const Handler = CreateHandler(Union, handler, HandlerReturnType);
 
-    const parseFn = struct {
-        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
             // would use for else, but that doesn't seem to like inline for very much
             var resultOpt: ?Union = null;
@@ -344,51 +433,37 @@ pub fn createOrParse(
                 const parseResult = try specItem.parse(fulltext, start, x);
                 if (parseResult == .errmsg) {
                     if (!parseResult.errmsg.recoverable)
-                        return parseResult;
+                        return Handler.errorCopy(parseResult.errmsg);
                 } else
-                    resultOpt = Union.from(i, parseResult.result.value, parseResult.result.range);
+                    resultOpt = try Union.from(i, parseResult.result.value, parseResult.result.range, x.alloc);
             }
-            const result = resultOpt orelse return errorValue("all ors failed", start.extend("  "));
-            // result.range shouldn't really exist but it's fine because it has to have some
-            // data anyway
-            var res = try x.alloc.create(Handler.Return);
-            res.* = Handler.handle(result, result.range);
-            return returnValue(res, result.range);
+            const result = resultOpt orelse return Handler.errorValue("all ors failed", start.extend("  "));
+            return Handler.returnValue(result, result.range);
         }
-    }.a;
-
-    return ParseDetails{
-        .parse = parseFn,
-        .ReturnType = Handler.Return,
+        pub const ReturnType = Handler.Return;
     };
 }
 
-pub fn createFutureParse(
+pub fn CreateFutureParse(
     comptime spec: var,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
     comptime parseTypesMap: ComptimeHashMap([]const u8, TopLevelParseDetails),
-) ParseDetails {
+) type {
     const resultDetails = parseTypesMap.get(@tagName(spec)) orelse @compileError("Unknown tldecl " ++ @tagName(spec));
 
     const Handler = CreateHandler(*const resultDetails.ReturnType, handler, HandlerReturnType);
 
-    const parseFn = struct {
-        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
             const parseResult = try x.parseFns[resultDetails.index](fulltext, start, x);
-            if (parseResult == .errmsg) return parseResult;
+            if (parseResult == .errmsg) return Handler.errorCopy(parseResult.errmsg);
             const result = parseResult.result.value.readAs(resultDetails.ReturnType);
             const range = parseResult.result.range;
 
-            var res = try x.alloc.create(Handler.Return);
-            res.* = Handler.handle(result, range);
-            return returnValue(res, range);
+            return Handler.returnValue(result, range);
         }
-    }.a;
-
-    return ParseDetails{
-        .parse = parseFn,
-        .ReturnType = Handler.Return,
+        pub const ReturnType = Handler.Return;
     };
 }
 
@@ -412,37 +487,27 @@ pub fn star(comptime spec: var) type {
         pub const __STAR_ARGS = spec;
     };
 }
-pub fn createStarParse(
-    comptime spec: ParseDetails,
+pub fn CreateStarParse(
+    comptime spec: type,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
-) ParseDetails {
-    const Handler = CreateHandler([]*const spec.ReturnType, handler, HandlerReturnType);
+) type {
+    const Handler = CreateHandler([]spec.ReturnType, handler, HandlerReturnType);
 
-    const parseFn = struct {
-        fn a(fulltext: []const u8, start: Point, x: Extra) OOM!ParseResult {
+    return struct {
+        fn parse(fulltext: []const u8, start: Point, x: Extra) OOM!Handler.FnReturn {
             const text = fulltext[start.byte..];
-            var fres = std.ArrayList(*const spec.ReturnType).init(x.alloc);
-            // huh, this might be doable
-            // this does offer more possabilities for non pointer returns
-            // the reason fn parse isn't generic is so it can be called at
-            // runtime though.
-            // maybe offer two versions of parse?
-            // one runtime and one generic?
-            // futureparse is the seam that uses the runtime one?
-            // and then we don't have to provide the runtime fn,
-            // Parser can generate it and we just provide the generic
-            // one. Parser adds the runtime one to its fn list.
+            var fres = std.ArrayList(spec.ReturnType).init(x.alloc);
             var cpos: Point = start;
             while (true) {
                 const pres = try spec.parse(fulltext, cpos, x);
                 if (pres == .errmsg) {
                     if (!pres.errmsg.recoverable)
-                        return pres;
+                        return Handler.errorCopy(pres.errmsg);
                     break;
                 }
                 cpos = pres.result.range.end;
-                try fres.append(pres.result.value.readAs(spec.ReturnType));
+                try fres.append(pres.result.value);
                 if (pres.result.range.start.byte == pres.result.range.end.byte)
                     break; // eg star(optional(" "))
                 // imagine what terrible things we could do with operator overloading
@@ -452,59 +517,51 @@ pub fn createStarParse(
             // here this can support plus with
             // if fres.len == 0 && isPlus
             //     return error
-            // result.range shouldn't really exist but it's fine because it has to have some
-            // data anyway
-            var res = try x.alloc.create(Handler.Return);
-            res.* = Handler.handle(fres.toOwnedSlice(), range);
-            return returnValue(res, range);
+            return Handler.returnValue(fres.toOwnedSlice(), range);
         }
-    }.a;
-
-    return ParseDetails{
-        .parse = parseFn,
-        .ReturnType = Handler.Return,
+        pub const ReturnType = Handler.Return;
     };
 }
 
-pub fn userToReal(
+pub fn UserToReal(
     comptime name: []const u8,
     comptime spec: var,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
     comptime parseTypesMap: ComptimeHashMap([]const u8, TopLevelParseDetails),
-) ParseDetails {
+) type {
     const Spec = @TypeOf(spec);
     if (isString(Spec))
-        return createStringParse(@as([]const u8, spec), handler, HandlerReturnType);
+        return CreateStringParse(@as([]const u8, spec), handler, HandlerReturnType);
     if (@typeInfo(Spec) == .Type and @typeInfo(spec) == .Struct and @hasDecl(spec, "__STAR_ARGS")) {
-        const realArg = userToReal(name ++ " > anon", spec.__STAR_ARGS, null, null, parseTypesMap);
-        return createStarParse(realArg, handler, HandlerReturnType);
+        const realArg = UserToReal(name ++ " > anon", spec.__STAR_ARGS, null, null, parseTypesMap);
+        return CreateStarParse(realArg, handler, HandlerReturnType);
     }
     if (@typeInfo(Spec) == .Struct) {
         // oh no this is a bit of a mess because handler, HandlerReturnType has to be routed to only one thing
-        var orMatches: []const []const ParseDetails = &[_][]const ParseDetails{};
-        var pdArray: []const ParseDetails = &[_]ParseDetails{};
+        var orMatches: []const []const type = &[_][]const type{};
+        var pdArray: []const type = &[_]type{};
         for (spec) |userItem, i| {
             if (@TypeOf(userItem) == type and userItem == Or) {
-                orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
-                pdArray = &[_]ParseDetails{};
+                orMatches = orMatches ++ &[_][]const type{pdArray};
+                pdArray = &[_]type{};
             } else
-                pdArray = pdArray ++ [_]ParseDetails{userToReal(name ++ " > anon", userItem, null, null, parseTypesMap)};
+                pdArray = pdArray ++ [_]type{UserToReal(name ++ " > anon", userItem, null, null, parseTypesMap)};
         }
-        orMatches = orMatches ++ &[_][]const ParseDetails{pdArray};
-        var allPMatches: []const ParseDetails = &[_]ParseDetails{};
+        orMatches = orMatches ++ &[_][]const type{pdArray};
+        var allPMatches: []const type = &[_]type{};
         for (orMatches) |om| {
             if (om.len > 1 and orMatches.len == 1)
-                allPMatches = allPMatches ++ [_]ParseDetails{createOrderedParse(om, handler, HandlerReturnType)};
+                allPMatches = allPMatches ++ [_]type{CreateOrderedParse(om, handler, HandlerReturnType)};
             if (om.len > 1)
-                allPMatches = allPMatches ++ [_]ParseDetails{createOrderedParse(om, null, null)};
+                allPMatches = allPMatches ++ [_]type{CreateOrderedParse(om, null, null)};
             if (om.len == 1)
-                allPMatches = allPMatches ++ [_]ParseDetails{om[0]};
+                allPMatches = allPMatches ++ [_]type{om[0]};
             if (om.len == 0)
                 @compileError("must have at least one thing per or");
         }
         if (orMatches.len > 1)
-            return createOrParse(allPMatches, handler, HandlerReturnType);
+            return CreateOrParse(allPMatches, handler, HandlerReturnType);
         if (orMatches.len == 1) {
             if (orMatches[0].len == 1)
                 @compileError("there must be at least two items in p");
@@ -513,20 +570,20 @@ pub fn userToReal(
         @compileError("must have at least one thing");
     }
     if (@TypeOf(Spec) == @TypeOf(.EnumLiteral) or std.mem.eql(u8, @typeName(Spec), "(enum literal)")) {
-        return createFutureParse(spec, handler, HandlerReturnType, parseTypesMap);
+        return CreateFutureParse(spec, handler, HandlerReturnType, parseTypesMap);
     }
     @compileLog(spec);
     @compileError("Unsupported: " ++ typePrint(Spec, 0) ++ " (named " ++ name ++ ")");
 }
 
-pub fn createParse(
+pub fn CreateParse(
     comptime name: []const u8,
     comptime spec: var,
     comptime handler: var,
     comptime HandlerReturnType: ?type,
     comptime parseTypesMap: ComptimeHashMap([]const u8, TopLevelParseDetails),
-) ParseDetails {
-    return comptime userToReal(name, spec, handler, HandlerReturnType, parseTypesMap);
+) type {
+    return comptime UserToReal(name, spec, handler, HandlerReturnType, parseTypesMap);
 }
 
 pub fn Parser(comptime spec: var, comptime Handlers: type) type {
@@ -540,14 +597,14 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
             if (!@hasDecl(Handlers, field.name))
                 @compileError("Missing pub fn " ++ field.name);
             if (parses.set(field.name, TopLevelParseDetails{
-                .parse = null,
+                .details = null,
                 .ReturnType = @field(Handlers, field.name ++ "_RV"),
                 .index = i,
             })) |detyls| @compileError("Duplicate key " ++ field.name);
         }
         for (fields) |field, i| {
             var item = parses.get(field.name).?;
-            const parseDetails = createParse(
+            const parseDetails = CreateParse(
                 field.name,
                 @field(spec, field.name),
                 @field(Handlers, field.name),
@@ -557,7 +614,7 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
             if (item.ReturnType != parseDetails.ReturnType)
                 @compileError("never");
             _ = parses.set(field.name, TopLevelParseDetails{
-                .parse = parseDetails.parse,
+                .details = parseDetails,
                 .ReturnType = item.ReturnType,
                 .index = item.index,
             });
@@ -565,7 +622,7 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
         const parseFns = blk: {
             var parseFns: [fields.len]ParseFn = undefined;
             for (parses.items) |item| {
-                parseFns[item.value.index] = item.value.parse.?;
+                parseFns[item.value.index] = createParseFn(item.value.details.?);
             }
             break :blk parseFns;
         };
@@ -581,16 +638,16 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
                 alloc: *Alloc,
             ) OOM!union {
                 result: struct {
-                    value: *const parses.get(@tagName(key)).?.ReturnType,
+                    value: parses.get(@tagName(key)).?.ReturnType,
                     range: Range,
                 },
                 errmsg: ErrResult,
             } {
                 const parseDetails = parses.get(@tagName(key)).?;
                 const xtra: Extra = .{ .alloc = alloc, .parseFns = &parseFns };
-                return switch (try parseDetails.parse.?(text, start, xtra)) {
+                return switch (try parseDetails.details.?.parse(text, start, xtra)) {
                     .result => |res| blk: {
-                        const result = res.value.readAs(parseDetails.ReturnType);
+                        const result = res.value;
                         break :blk .{ .result = .{ .value = result, .range = res.range } };
                     },
                     .errmsg => |emsg| blk: {
@@ -611,6 +668,78 @@ test "" {
     try main();
 }
 
+pub fn anotherTest() !void {
+    const ast = struct {
+        // it would be nice if I could have a field here .range
+        // that was on every union value
+        // unfortunately I can't.
+        // instead, I must have struct {range, expr: ...}
+        // then instead of switch(v) I must switch(v.expr)
+        // oh and initialization is a pain
+        pub const BinOp = enum { add, sub, mul, div };
+        pub const Expr = struct {
+            range: Range, expr: union(enum) {
+                binexpr: struct {
+                    op: BinOp,
+                    l: *const Expr,
+                    r: *const Expr,
+                },
+                number: u64,
+            }
+        };
+    };
+    const parser = Parser(.{
+        .math = .addsub,
+        .addsub = .{ .muldiv, star(.{ .{ "+", Or, "-" }, .muldiv }) },
+        .muldiv = .{ .number, star(.{ .{ "*", Or, "/" }, .number }) },
+        .number = .{plus(range('0', '9'))}, // fun! *const []const *const u8
+        // even though often user code might want pointers, it's a good
+        // idea for the user code to have to allocate explicitly except
+        // across borders
+        // this way plus(range('0', '9')) could return a sensible []const u8
+        // and range('0', '9') returns u8 instead of ending with the terrible mess
+        // of *const []const *const u8
+    }, struct {
+        pub const math_RV = Expr;
+        pub fn math(items: var, range: Range) Expr {
+            return items.get(0); // .getpos for positions
+        }
+        pub const addsub_RV = Expr;
+        // items: var, x: Extra incl range and alloc?
+        // what if instead of .get/.getrange there was a seperate
+        // range() that returned {value: ?, range: Range}
+        // and then there wasn't the mess of .value.value.value
+        // when it's unnecessary
+        fn binexpr(mappings: []ast.BinOp, items: var, range: Range) ast.Expr {
+            const a0 = items.get(0);
+            const list = items.get(1);
+            if (list.len == 0) {
+                // .* should not be required, especially since
+                // this is just going to be allocated again
+                return items.get(0).*;
+            }
+            if (list.len == 1) {
+                return .{
+                    .range = range,
+                    .binexpr = .{
+                        .op = switch (list.get(1).get(0).index) {
+                            0 => .add,
+                            1 => .sub,
+                        },
+                        .l = a0,
+                        .r = list.get(1).get(1),
+                    },
+                };
+            }
+            // (requires allocator and some thought)
+            @panic("not supported yet multiple items");
+        }
+        pub fn addsub(items: var, range: Range) Expr {
+            binexpr(.{ .add, .sub }, items, range);
+        }
+    });
+}
+
 pub fn main() !void {
     // takes a lot of eval branch quota because of things like the O(n) "hash"map
     @setEvalBranchQuota(100_000);
@@ -628,6 +757,14 @@ pub fn main() !void {
         .addsub = .{ .muldiv, star(.{ .{ "+", Or, "-" }, .muldiv }) },
         .muldiv = .{ .number, star(.{ .{ "*", Or, "/" }, .number }) },
         .number = .{ "1", Or, "2", Or, "3" },
+        // optional support next?
+        // most of the places I use optional are starlastoptional
+        // .{star(.{.expr, _, ",", _}), optional(.expr)}
+
+        // lockin has to be handled by the p()
+        // a, Lockin, b, c, d
+        // if anything past lockin fails, it has to error unrecoverable
+
         // const _ = ._;
         // starlastoptional(.{.arg, _}, .{",", _});
     }, struct {
@@ -641,7 +778,7 @@ pub fn main() !void {
         }
         pub const nestedtest_RV = []const u8;
         pub fn nestedtest(items: var, range: Range) []const u8 {
-            return items.get(0).value.value;
+            return items.get(0);
         }
         pub const reftest_RV = u1;
         pub fn reftest(items: var, range: Range) reftest_RV {
@@ -653,30 +790,30 @@ pub fn main() !void {
         }
         pub const addsub_RV = u64;
         pub fn addsub(items: var, range: Range) addsub_RV {
-            var result = items.get(0).value.value.*;
-            for (items.get(1).value.value) |itm| {
+            var result = items.get(0).*;
+            for (items.get(1)) |itm| {
                 // if(itm.value.get(0).value.value.*[0] == '+')
                 //    add
                 // else
                 //    subtract
-                result += itm.value.get(1).value.value.*;
+                result += itm.get(1).*;
             }
             return result;
         }
         pub const muldiv_RV = u64;
         pub fn muldiv(items: var, range: Range) muldiv_RV {
-            var result = items.get(0).value.value.*;
-            for (items.get(1).value.value) |itm| {
-                result *= itm.value.get(1).value.value.*;
+            var result = items.get(0).*;
+            for (items.get(1)) |itm| {
+                result *= itm.get(1).*;
             }
             return result;
         }
         pub const number_RV = u64;
         pub fn number(items: var, range: Range) number_RV {
             const value = items.any();
-            if (std.mem.eql(u8, value.value, "1")) return 1;
-            if (std.mem.eql(u8, value.value, "2")) return 2;
-            if (std.mem.eql(u8, value.value, "3")) return 3;
+            if (std.mem.eql(u8, value, "1")) return 1;
+            if (std.mem.eql(u8, value, "2")) return 2;
+            if (std.mem.eql(u8, value, "3")) return 3;
             unreachable;
             // or go based on value.index, but this works too
             // in js, I would do or(c`1`.scb(r => 1), c`2`.scb(r => 2), c`3`.scb(r => 3))
@@ -686,27 +823,27 @@ pub fn main() !void {
         }
     });
     testing.expect(
-        std.mem.eql(u8, (try parser.parse(.stringtest, "test", Point.start, arena)).result.value.*, "test"),
+        std.mem.eql(u8, (try parser.parse(.stringtest, "test", Point.start, arena)).result.value, "test"),
     );
     const res = (try parser.parse(.stringtest, "test", Point.start, arena));
-    std.debug.warn("res: {}\n", .{res.result.value.*});
+    std.debug.warn("res: {}\n", .{res.result.value});
     const res3 = (try parser.parse(.stringtest, "testing", Point.start, arena));
-    std.debug.warn("res: {}, rng: {}\n", .{ res3.result.value.*, res3.result.range });
+    std.debug.warn("res: {}, rng: {}\n", .{ res3.result.value, res3.result.range });
     const res2 = (try parser.parse(.stringtest, "tst", Point.start, arena));
     std.debug.warn("err: {}\n", .{res2.errmsg.message});
 
     const res4 = (try parser.parse(.ordertest, "test-interesting", Point.start, arena));
-    std.debug.warn("res: {}\n", .{res4.result.value.*});
+    std.debug.warn("res: {}\n", .{res4.result.value});
     const res5 = (try parser.parse(.ordertest, "test!interesting", Point.start, arena));
     std.debug.warn("res: {}, rng: {}\n", .{ res5.errmsg.message, res5.errmsg.range });
 
     const res7 = try parser.parse(.nestedtest, "one two", Point.start, arena);
-    std.debug.warn("res7: {}\n", .{res7.result.value.*});
+    std.debug.warn("res7: {}\n", .{res7.result.value});
 
     const res8 = (try parser.parse(.reftest, "====huh", Point.start, arena));
     std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
 
     const mathequ = try parser.parse(.math, "1+3*2+2", Point.start, arena);
-    std.debug.warn("math res: {}\n", .{mathequ.result.value.*});
-    testing.expectEqual(mathequ.result.value.*, 9);
+    std.debug.warn("math res: {}\n", .{mathequ.result.value});
+    testing.expectEqual(mathequ.result.value, 9);
 }
