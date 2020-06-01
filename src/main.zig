@@ -1,4 +1,5 @@
 const std = @import("std");
+const DiscardableAllocator = @import("DiscardableAllocator.zig");
 const meta = std.meta;
 const testing = std.testing;
 const Alloc = std.mem.Allocator;
@@ -148,6 +149,7 @@ const TopLevelParseDetails = struct {
 
 const Extra = struct {
     alloc: *Alloc,
+    discardable: *DiscardableAllocator,
     parseFns: []const ParseFn,
 };
 
@@ -430,11 +432,15 @@ pub fn CreateOrParse(
             // would use for else, but that doesn't seem to like inline for very much
             var resultOpt: ?Union = null;
             inline for (spec) |specItem, i| {
+                try x.discardable.start(); // if this fails, it's ok because it will throw up until it reaches the thing that will free it
+                defer x.discardable.end();
                 const parseResult = try specItem.parse(fulltext, start, x);
-                if (parseResult == .errmsg) {
+                if (parseResult == .errmsg)
                     if (!parseResult.errmsg.recoverable)
-                        return Handler.errorCopy(parseResult.errmsg);
-                } else
+                        return Handler.errorCopy(parseResult.errmsg)
+                    else
+                        x.discardable.trash()
+                else
                     resultOpt = try Union.from(i, parseResult.result.value, parseResult.result.range, x.alloc);
             }
             const result = resultOpt orelse return Handler.errorValue("all ors failed", start.extend("  "));
@@ -635,7 +641,7 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
                 comptime key: var,
                 text: []const u8,
                 start: Point,
-                alloc: *Alloc,
+                discardable: *DiscardableAllocator,
             ) OOM!union {
                 result: struct {
                     value: parses.get(@tagName(key)).?.ReturnType,
@@ -644,8 +650,18 @@ pub fn Parser(comptime spec: var, comptime Handlers: type) type {
                 errmsg: ErrResult,
             } {
                 const parseDetails = parses.get(@tagName(key)).?;
-                const xtra: Extra = .{ .alloc = alloc, .parseFns = &parseFns };
-                return switch (try parseDetails.details.?.parse(text, start, xtra)) {
+                const xtra: Extra = .{
+                    .alloc = &discardable.allocator,
+                    .discardable = discardable,
+                    .parseFns = &parseFns,
+                };
+
+                try discardable.start();
+                defer discardable.end();
+                errdefer discardable.trash();
+
+                const parseResult = try parseDetails.details.?.parse(text, start, xtra);
+                return switch (parseResult) {
                     .result => |res| blk: {
                         const result = res.value;
                         break :blk .{ .result = .{ .value = result, .range = res.range } };
@@ -744,10 +760,10 @@ pub fn main() !void {
     // takes a lot of eval branch quota because of things like the O(n) "hash"map
     @setEvalBranchQuota(100_000);
 
-    var alloc = std.heap.page_allocator;
-    var arenaAllocator = std.heap.ArenaAllocator.init(alloc);
-    defer arenaAllocator.deinit();
-    var arena = &arenaAllocator.allocator;
+    var allocator = std.heap.page_allocator;
+    var discardable = DiscardableAllocator.init(allocator);
+    defer discardable.deinit();
+    var alloc = &discardable.allocator;
     const parser = Parser(.{
         .stringtest = "test",
         .ordertest = .{ "test", "-", "interesting" },
@@ -822,28 +838,31 @@ pub fn main() !void {
             // I do want to avoid inline functions because it makes the spec less clear.
         }
     });
+
+    try discardable.start();
+    defer discardable.trashEnd();
     testing.expect(
-        std.mem.eql(u8, (try parser.parse(.stringtest, "test", Point.start, arena)).result.value, "test"),
+        std.mem.eql(u8, (try parser.parse(.stringtest, "test", Point.start, &discardable)).result.value, "test"),
     );
-    const res = (try parser.parse(.stringtest, "test", Point.start, arena));
+    const res = try parser.parse(.stringtest, "test", Point.start, &discardable);
     std.debug.warn("res: {}\n", .{res.result.value});
-    const res3 = (try parser.parse(.stringtest, "testing", Point.start, arena));
+    const res3 = try parser.parse(.stringtest, "testing", Point.start, &discardable);
     std.debug.warn("res: {}, rng: {}\n", .{ res3.result.value, res3.result.range });
-    const res2 = (try parser.parse(.stringtest, "tst", Point.start, arena));
+    const res2 = try parser.parse(.stringtest, "tst", Point.start, &discardable);
     std.debug.warn("err: {}\n", .{res2.errmsg.message});
 
-    const res4 = (try parser.parse(.ordertest, "test-interesting", Point.start, arena));
+    const res4 = try parser.parse(.ordertest, "test-interesting", Point.start, &discardable);
     std.debug.warn("res: {}\n", .{res4.result.value});
-    const res5 = (try parser.parse(.ordertest, "test!interesting", Point.start, arena));
+    const res5 = try parser.parse(.ordertest, "test!interesting", Point.start, &discardable);
     std.debug.warn("res: {}, rng: {}\n", .{ res5.errmsg.message, res5.errmsg.range });
 
-    const res7 = try parser.parse(.nestedtest, "one two", Point.start, arena);
+    const res7 = try parser.parse(.nestedtest, "one two", Point.start, &discardable);
     std.debug.warn("res7: {}\n", .{res7.result.value});
 
-    const res8 = (try parser.parse(.reftest, "====huh", Point.start, arena));
+    const res8 = try parser.parse(.reftest, "====huh", Point.start, &discardable);
     std.debug.warn("res: {}, rng: {}\n", .{ res8.errmsg.message, res8.errmsg.range });
 
-    const mathequ = try parser.parse(.math, "1+3*2+2", Point.start, arena);
+    const mathequ = try parser.parse(.math, "1+3*2+2", Point.start, &discardable);
     std.debug.warn("math res: {}\n", .{mathequ.result.value});
     testing.expectEqual(mathequ.result.value, 9);
 }

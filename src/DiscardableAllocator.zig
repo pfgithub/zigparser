@@ -1,3 +1,4 @@
+// if this were c/c++, I never would have thought of something like this
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const DiscardableAllocator = @This();
@@ -6,13 +7,9 @@ allocator: Allocator,
 
 child_allocator: *Allocator,
 arenas: std.ArrayList(std.heap.ArenaAllocator),
-// allocator: arenas[arenas.len - 1].allocator
-// start: arenas.append(ArenaAllocator.init(child_allocator))
-// trash: arenas.pop().deinit();
-// end:   lastArena = arenas.pop();
-//        arenas[arenas.len - 1]:mergeWith(lastArena)
+flag_trash: bool,
 
-/// starts empty. make sure to call .start() after initializing
+/// starts empty. make sure to call .start() before using
 pub fn init(child_allocator: *Allocator) DiscardableAllocator {
     return DiscardableAllocator{
         .allocator = Allocator{
@@ -21,6 +18,7 @@ pub fn init(child_allocator: *Allocator) DiscardableAllocator {
         },
         .child_allocator = child_allocator,
         .arenas = std.ArrayList(std.heap.ArenaAllocator).init(child_allocator),
+        .flag_trash = false,
     };
 }
 
@@ -34,13 +32,27 @@ pub fn deinit(self: *DiscardableAllocator) void {
 pub fn start(self: *DiscardableAllocator) !void {
     try self.arenas.append(std.heap.ArenaAllocator.init(self.child_allocator));
 }
-// free the memory of the latest section
+// free the memory of the latest section and end.
+pub fn trashEnd(self: *DiscardableAllocator) void {
+    self.trash();
+    self.end();
+}
+// free the memory of the latest section. make sure to
+// call .end() after this before allocating any more memory!
 pub fn trash(self: *DiscardableAllocator) void {
-    self.arenas.pop().deinit();
+    if (self.flag_trash) unreachable;
+    self.flag_trash = true;
 }
 // end the latest section succesfully
 pub fn end(self: *DiscardableAllocator) void {
     var childArena = self.arenas.pop();
+
+    defer self.flag_trash = false;
+    if (self.flag_trash) {
+        childArena.deinit();
+        return;
+    }
+
     var parentArena = &self.arenas.items[self.arenas.items.len - 1];
 
     if (childArena.buffer_list.first == null) return; // nothing to merge;
@@ -54,7 +66,7 @@ pub fn end(self: *DiscardableAllocator) void {
         if (parentArena.end_index != 0) unreachable;
         return;
     }
-    var insertAfter = parentArena.buffer_list.first.?.next.?;
+    const insertAfter = parentArena.buffer_list.first.?;
     childLast.next = insertAfter.next;
     insertAfter.next = childFirst;
 }
@@ -62,6 +74,7 @@ pub fn end(self: *DiscardableAllocator) void {
 fn realloc(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize, new_align: u29) Allocator.Error![]u8 {
     const self = @fieldParentPtr(DiscardableAllocator, "allocator", allocator);
     if (self.arenas.items.len == 0) unreachable;
+    if (self.flag_trash) unreachable;
     const arena = &self.arenas.items[self.arenas.items.len - 1].allocator;
     return arena.reallocFn(arena, old_mem, old_align, new_size, new_align);
 }
@@ -69,6 +82,7 @@ fn realloc(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize
 fn shrink(allocator: *Allocator, old_mem: []u8, old_align: u29, new_size: usize, new_align: u29) []u8 {
     const self = @fieldParentPtr(DiscardableAllocator, "allocator", allocator);
     if (self.arenas.items.len == 0) unreachable;
+    if (self.flag_trash) unreachable;
     const arena = &self.arenas.items[self.arenas.items.len - 1].allocator;
     return arena.shrinkFn(arena, old_mem, old_align, new_size, new_align);
 }
@@ -79,7 +93,7 @@ test "discardable allocator" {
     var talloc = DiscardableAllocator.init(std.heap.page_allocator);
     defer talloc.deinit();
     try talloc.start();
-    defer talloc.trash();
+    defer talloc.trashEnd();
 
     var alloc = &talloc.allocator;
 
@@ -95,11 +109,12 @@ test "discardable allocator" {
 
     var trashedmem = blk: {
         try talloc.start();
-        defer talloc.trash();
+        defer talloc.trashEnd();
 
         var trashedmem = try alloc.create(u8);
-        trashedmem.* = 32;
+        trashedmem.* = 25;
         break :blk trashedmem;
     };
-    // expect eg segmentation fault on trashedmem.*
+    // expectEqual(trashedmem.*, 25);
+    // expect segmentation fault on trashedmem.*
 }
